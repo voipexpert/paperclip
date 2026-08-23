@@ -134,6 +134,11 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     disabledLabel: "Invite external agents from the add-agent modal",
     hideFromVisualSelection: true,
   },
+  firstmate_gateway: {
+    label: "FirstMate Gateway",
+    description: "Primary coding executor via the FirstMate relay",
+    icon: Bot,
+  },
   process: {
     label: "Process",
     description: "Internal process adapter",
