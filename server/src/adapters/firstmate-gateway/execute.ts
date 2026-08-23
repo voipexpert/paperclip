@@ -1,7 +1,7 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { WebSocket } from "ws";
 
-type Frame = { type?: unknown; event?: unknown; data?: unknown; runId?: unknown; agentId?: unknown; kind?: unknown; message?: unknown; accepted?: unknown; error?: unknown };
+type Frame = { type?: unknown; event?: unknown; data?: unknown; runId?: unknown; agentId?: unknown; kind?: unknown; message?: unknown; accepted?: unknown; state?: unknown; position?: unknown; error?: unknown };
 const terminal = new Set(["completed", "failed", "cancelled"]);
 
 function text(value: unknown): string | null { return typeof value === "string" && value.trim() ? value.trim() : null; }
@@ -44,7 +44,17 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
         return;
       }
       if (frame.type === "paperclip.dispatch_ack" && frame.runId === context.runId) {
-        if (frame.accepted === true) { acknowledged = true; await context.onLog("stdout", "FirstMate accepted Paperclip run.\n"); return; }
+        if (frame.accepted === true) {
+          acknowledged = true;
+          const queuePosition = typeof frame.position === "number" && Number.isInteger(frame.position) && frame.position > 0
+            ? frame.position
+            : null;
+          const acknowledgement = frame.state === "queued" && queuePosition
+            ? `FirstMate queued Paperclip run at position ${queuePosition}.\n`
+            : "FirstMate accepted Paperclip run.\n";
+          await context.onLog("stdout", acknowledgement);
+          return;
+        }
         const reason = text(frame.error);
         finish({ exitCode: 1, signal: null, timedOut: false, errorMessage: reason ? `FirstMate Gateway rejected the run: ${reason}.` : "FirstMate Gateway rejected the run.", errorCode: "FIRSTMATE_REJECTED" });
         return;
