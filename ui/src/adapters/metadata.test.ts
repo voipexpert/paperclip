@@ -37,6 +37,12 @@ describe("adapter metadata", () => {
     expect(isEnabledAdapterType("http")).toBe(false);
   });
 
+  it("makes the shipped OpenClaw Gateway adapter selectable", () => {
+    expect(isEnabledAdapterType("openclaw_gateway")).toBe(true);
+    expect(isValidAdapterType("openclaw_gateway")).toBe(true);
+    expect(isVisualAdapterChoice("openclaw_gateway")).toBe(true);
+  });
+
   it("marks the retired ACPX adapter as unavailable for new selections", () => {
     expect(isEnabledAdapterType("acpx_local")).toBe(false);
     expect(isValidAdapterType("acpx_local")).toBe(false);

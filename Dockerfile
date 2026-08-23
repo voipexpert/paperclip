@@ -51,6 +51,10 @@ RUN pnpm install --frozen-lockfile
 
 FROM base AS build
 WORKDIR /app
+# TypeScript's server build exceeds Node's default 2 GiB old-space limit on
+# the production VM. This affects build-time only; the runtime image does not
+# inherit the setting.
+ENV NODE_OPTIONS=--max-old-space-size=4096
 COPY --from=deps /app /app
 COPY . .
 RUN pnpm --filter @paperclipai/ui build

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentParams, resolveClaimedApiKeyPath, resolveSessionKey } from "./execute.js";
+import {
+  buildAgentParams,
+  preserveAssistantEventText,
+  resolveClaimedApiKeyPath,
+  resolveSessionKey,
+} from "./execute.js";
 
 describe("resolveSessionKey", () => {
   it("prefixes run-scoped session keys with the configured agent", () => {
@@ -121,5 +126,11 @@ describe("resolveClaimedApiKeyPath", () => {
   it("falls back to the shared default when value is not a string", () => {
     expect(resolveClaimedApiKeyPath(42)).toBe(DEFAULT_PATH);
     expect(resolveClaimedApiKeyPath({})).toBe(DEFAULT_PATH);
+  });
+});
+
+describe("preserveAssistantEventText", () => {
+  it("preserves leading whitespace from streamed assistant deltas", () => {
+    expect(preserveAssistantEventText(" reviewer")).toBe(" reviewer");
   });
 });
