@@ -107,6 +107,14 @@ function nonEmpty(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+/**
+ * Streaming deltas are compositional: leading whitespace is part of the
+ * response and must survive until chunks are joined into the final summary.
+ */
+export function preserveAssistantEventText(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
 function parseOptionalPositiveInteger(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.max(1, Math.floor(value));
@@ -1191,8 +1199,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
 
       if (stream === "assistant") {
-        const delta = nonEmpty(data.delta);
-        const text = nonEmpty(data.text);
+        const delta = preserveAssistantEventText(data.delta);
+        const text = preserveAssistantEventText(data.text);
         if (delta) {
           assistantChunks.push(delta);
         } else if (text) {
