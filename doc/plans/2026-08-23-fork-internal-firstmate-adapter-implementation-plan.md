@@ -171,4 +171,3 @@ Push the feature branch to `origin`, create a PR into `voipexpert/paperclip:mast
 - [ ] **Step 5: Reverify fork and production separation**
 
 Confirm GitHub fork `master` equals the PR merge commit. On `plane`, verify `/opt/paperclip/source` remains detached at `e0b482238739efba540d0f8804d4bf6ec572cf5a`, the production container remains running, and `http://127.0.0.1:3100/api/health` returns HTTP `200` with `status: ok`.
-

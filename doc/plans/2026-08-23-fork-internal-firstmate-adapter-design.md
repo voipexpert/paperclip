@@ -45,4 +45,3 @@ The implementation will use test-first checks that initially fail while FirstMat
 - Changing the FirstMate wire protocol or UI behavior.
 - Deploying or restarting production.
 - Refactoring unrelated Paperclip adapters or release tooling.
-
