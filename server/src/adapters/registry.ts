@@ -118,12 +118,14 @@ import {
 } from "@paperclipai/adapter-opencode-local";
 import {
   execute as firstmateGatewayExecute,
+} from "./firstmate-gateway/execute.js";
+import {
   testEnvironment as firstmateGatewayTestEnvironment,
-} from "@paperclipai/adapter-firstmate-gateway/server";
+} from "./firstmate-gateway/test.js";
 import {
   agentConfigurationDoc as firstmateGatewayAgentConfigurationDoc,
   models as firstmateGatewayModels,
-} from "@paperclipai/adapter-firstmate-gateway";
+} from "./firstmate-gateway/index.js";
 import {
   execute as openclawGatewayExecute,
   testEnvironment as openclawGatewayTestEnvironment,
