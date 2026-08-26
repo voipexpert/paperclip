@@ -14373,6 +14373,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           workMode: issueContext.workMode,
           description: issueContext.description,
           projectId: issueContext.projectId,
+          assigneeAgentId: issueContext.assigneeAgentId,
           projectWorkspaceId: issueContext.projectWorkspaceId,
           executionWorkspaceId: issueContext.executionWorkspaceId,
           executionWorkspacePreference: issueContext.executionWorkspacePreference,
@@ -14470,6 +14471,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         identifier: issueRef.identifier,
         title: issueRef.title,
         description: issueRef.description,
+        status: issueRef.status,
+        assigneeAgentId: issueRef.assigneeAgentId,
+        projectId: issueRef.projectId,
         workMode: issueRef.workMode,
       };
     } else {

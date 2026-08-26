@@ -126,6 +126,12 @@ import {
   agentConfigurationDoc as firstmateGatewayAgentConfigurationDoc,
   models as firstmateGatewayModels,
 } from "./firstmate-gateway/index.js";
+import { execute as openhandsGatewayExecute } from "./openhands-gateway/execute.js";
+import { testEnvironment as openhandsGatewayTestEnvironment } from "./openhands-gateway/test.js";
+import {
+  agentConfigurationDoc as openhandsGatewayAgentConfigurationDoc,
+  models as openhandsGatewayModels,
+} from "./openhands-gateway/index.js";
 import {
   execute as openclawGatewayExecute,
   testEnvironment as openclawGatewayTestEnvironment,
@@ -474,6 +480,17 @@ const firstmateGatewayAdapter: ServerAdapterModule = {
   agentConfigurationDoc: firstmateGatewayAgentConfigurationDoc,
 };
 
+const openhandsGatewayAdapter: ServerAdapterModule = {
+  type: "openhands_gateway",
+  execute: openhandsGatewayExecute,
+  testEnvironment: openhandsGatewayTestEnvironment,
+  models: openhandsGatewayModels,
+  supportsLocalAgentJwt: false,
+  supportsInstructionsBundle: false,
+  requiresMaterializedRuntimeSkills: false,
+  agentConfigurationDoc: openhandsGatewayAgentConfigurationDoc,
+};
+
 const openclawGatewayAdapter: ServerAdapterModule = {
   type: "openclaw_gateway",
   execute: openclawGatewayExecute,
@@ -550,6 +567,7 @@ function registerBuiltInAdapters() {
     hermesGatewayAdapter,
     hermesLocalAdapter,
     firstmateGatewayAdapter,
+    openhandsGatewayAdapter,
     openclawGatewayAdapter,
     processAdapter,
     httpAdapter,
