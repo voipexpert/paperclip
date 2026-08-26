@@ -274,14 +274,36 @@ describe("OpenHands gateway contract", () => {
     } finally { await testGateway.close(); }
   });
 
-  it("keeps a pre-accept disconnect as an ordinary disconnected result", async () => {
+  it("records a close after dispatch send but before acknowledgement as indeterminate", async () => {
     await setGatewayToken();
     const testGateway = await gateway((socket) => {
       socket.send(JSON.stringify({ type: "hello", version: 1 }));
       socket.on("message", () => socket.close());
     });
     try {
-      await expect(execute(context(testGateway.port))).resolves.toMatchObject({ errorCode: "OPENHANDS_DISCONNECTED" });
+      await expect(execute(context(testGateway.port))).resolves.toMatchObject({
+        errorCode: "OPENHANDS_INDETERMINATE",
+        clearSession: false,
+        resultJson: { state: "indeterminate", reason: "post_dispatch_disconnect" },
+      });
+    } finally { await testGateway.close(); }
+  });
+
+  it("records a socket error after dispatch send but before acknowledgement as indeterminate", async () => {
+    await setGatewayToken();
+    const testGateway = await gateway((socket) => {
+      socket.send(JSON.stringify({ type: "hello", version: 1 }));
+      socket.on("message", () => {
+        const transport = socket as unknown as { _socket: { write: (data: Uint8Array) => boolean } };
+        transport._socket.write(Buffer.from([0x81, 0x80, 0x00, 0x00, 0x00, 0x00]));
+      });
+    });
+    try {
+      await expect(execute(context(testGateway.port))).resolves.toMatchObject({
+        errorCode: "OPENHANDS_INDETERMINATE",
+        clearSession: false,
+        resultJson: { state: "indeterminate", reason: "post_dispatch_disconnect" },
+      });
     } finally { await testGateway.close(); }
   });
 
@@ -335,6 +357,33 @@ describe("OpenHands gateway contract", () => {
       const result = await resultPromise;
       expect(result).toMatchObject({ exitCode: 1, timedOut: true, errorCode: "OPENHANDS_TIMEOUT" });
       expect(received.filter((frame) => frame.type === "cancel")).toEqual([{ type: "cancel", version: 1, runId: "run-1", taskId: "task-1", agentId: "agent-oh" }]);
+    } finally { vi.useRealTimers(); await testGateway.close(); }
+  });
+
+  it("keeps OPENHANDS_TIMEOUT when the socket errors during cancellation grace", async () => {
+    await setGatewayToken();
+    let dispatchSeen!: () => void;
+    const dispatchReceived = new Promise<void>((resolve) => { dispatchSeen = resolve; });
+    const testGateway = await gateway((socket) => {
+      socket.send(JSON.stringify({ type: "hello", version: 1 }));
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+        if (frame.type === "dispatch") {
+          dispatchSeen();
+          socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, accepted: true }));
+        }
+        if (frame.type === "cancel") {
+          const transport = socket as unknown as { _socket: { write: (data: Uint8Array) => boolean } };
+          transport._socket.write(Buffer.from([0x81, 0x80, 0x00, 0x00, 0x00, 0x00]));
+        }
+      });
+    });
+    try {
+      vi.useFakeTimers();
+      const resultPromise = execute(context(testGateway.port));
+      await dispatchReceived;
+      await vi.advanceTimersByTimeAsync(65_000);
+      await expect(resultPromise).resolves.toMatchObject({ errorCode: "OPENHANDS_TIMEOUT", timedOut: true });
     } finally { vi.useRealTimers(); await testGateway.close(); }
   });
 });

@@ -104,6 +104,7 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
   return new Promise((resolve) => {
     let settled = false;
     let dispatched = false;
+    let dispatchSent = false;
     let acknowledged = false;
     let cancellationStarted = false;
     let cancelWaitTimer: ReturnType<typeof setTimeout> | null = null;
@@ -129,9 +130,12 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
       cancelWaitTimer = setTimeout(() => finish(result("OPENHANDS_TIMEOUT", true)), CANCEL_ACK_WAIT_MS);
     }, config.timeoutMs);
 
-    socket.on("error", () => acknowledged ? indeterminate() : finish(result("OPENHANDS_UNREACHABLE")));
+    socket.on("error", () => {
+      if (cancellationStarted) return;
+      dispatchSent ? indeterminate() : finish(result("OPENHANDS_UNREACHABLE"));
+    });
     socket.on("close", () => {
-      if (!settled && !cancellationStarted) acknowledged ? indeterminate() : finish(result("OPENHANDS_DISCONNECTED"));
+      if (!settled && !cancellationStarted) dispatchSent ? indeterminate() : finish(result("OPENHANDS_DISCONNECTED"));
     });
     socket.on("message", async (raw) => {
       let incoming: Record<string, unknown> | null;
@@ -141,7 +145,10 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
         if (!isHello(incoming)) { finish(result("OPENHANDS_PROTOCOL")); return; }
         if (dispatched) return;
         dispatched = true;
-        try { socket.send(JSON.stringify(dispatch)); } catch { finish(result("OPENHANDS_UNREACHABLE")); }
+        try {
+          socket.send(JSON.stringify(dispatch));
+          dispatchSent = true;
+        } catch { finish(result("OPENHANDS_UNREACHABLE")); }
         return;
       }
       if (!matches(incoming, dispatch)) return;
