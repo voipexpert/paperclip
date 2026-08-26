@@ -40,6 +40,7 @@ const MAX_IDENTIFIER_BYTES = 128;
 const MAX_TITLE_CHARACTERS = 300;
 const MAX_OBJECTIVE_BYTES = 20_000;
 const MAX_TOKEN_BYTES = 4_096;
+const MAX_URL_BYTES = 2_048;
 const MIN_TIMEOUT_SEC = 60;
 const MAX_TIMEOUT_SEC = 7_200;
 
@@ -71,7 +72,7 @@ function configSource(value: AdapterExecutionContext | Record<string, unknown>):
 export function parseOpenHandsConfig(value: AdapterExecutionContext | Record<string, unknown>): OpenHandsConfig | ContractError {
   const input = configSource(value);
   if (!input || !hasOnlyKeys(input, ["url", "timeoutSec", "projectTargets"])) return new ContractError("OPENHANDS_CONFIG");
-  if (typeof input.url !== "string" || typeof input.timeoutSec !== "number" || !Number.isFinite(input.timeoutSec)) {
+  if (typeof input.url !== "string" || Buffer.byteLength(input.url, "utf8") > MAX_URL_BYTES || typeof input.timeoutSec !== "number" || !Number.isFinite(input.timeoutSec)) {
     return new ContractError("OPENHANDS_CONFIG");
   }
   let url: URL;
