@@ -238,7 +238,7 @@ describe("OpenHands gateway contract", () => {
     }
   });
 
-  it("rejects runtime skills and every unknown key when execute is called directly", async () => {
+  it("rejects runtime skills when execute is called directly", async () => {
     await setGatewayToken();
     const base = context(1);
     const runtimeSkills = [{ key: "company/review", runtimeName: "review", source: "managed" }];
@@ -249,10 +249,14 @@ describe("OpenHands gateway contract", () => {
 
     expect(parseOpenHandsConfig(liveContext.config)).toBeInstanceOf(Error);
     await expect(execute(liveContext)).resolves.toMatchObject({ errorCode: "OPENHANDS_CONFIG" });
+  });
 
+  it("rejects an operator unknown key when execute is called directly", async () => {
+    await setGatewayToken();
+    const base = context(1);
     const unknownContext = {
-      ...liveContext,
-      config: { ...liveContext.config, operatorUnknown: true },
+      ...base,
+      config: { ...base.config, operatorUnknown: true },
     };
     await expect(execute(unknownContext)).resolves.toMatchObject({ errorCode: "OPENHANDS_CONFIG" });
   });

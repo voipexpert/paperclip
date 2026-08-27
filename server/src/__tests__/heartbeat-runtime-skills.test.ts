@@ -162,6 +162,68 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     await tempDb?.cleanup();
   });
 
+  it("omits core runtime skills only at the actual OpenHands adapter handoff", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    let capturedConfig: Record<string, unknown> | null = null;
+    let capturedRuntimeSpecConfig: Record<string, unknown> | null = null;
+    registerServerAdapter({
+      type: "openhands_gateway",
+      getRuntimeCommandSpec: (config) => {
+        capturedRuntimeSpecConfig = config;
+        return null;
+      },
+      execute: async (ctx) => {
+        capturedConfig = ctx.config;
+        return { exitCode: 0, signal: null, timedOut: false, label: "Captured OpenHands config" };
+      },
+      testEnvironment: async () => ({
+        adapterType: "openhands_gateway",
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "OpenHands Runtime Boundary",
+        issuePrefix: `O${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "OpenHands Capture",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openhands_gateway",
+        adapterConfig: {
+          url: "wss://gateway.example/paperclip-worker/v1",
+          timeoutSec: 60,
+          projectTargets: {
+            project: { repository: "owner/repo", baseRef: "main", profile: "openhands" },
+          },
+          operatorUnknown: true,
+        },
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      const heartbeat = heartbeatService(db);
+      const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(run).not.toBeNull();
+      expect((await waitForRunToFinish(heartbeat, run!.id))?.status).toBe("succeeded");
+      expect(capturedConfig).toMatchObject({ operatorUnknown: true });
+      expect(capturedConfig).not.toHaveProperty("paperclipRuntimeSkills");
+      expect(capturedRuntimeSpecConfig).toMatchObject({ operatorUnknown: true });
+      expect(capturedRuntimeSpecConfig).not.toHaveProperty("paperclipRuntimeSkills");
+    } finally {
+      unregisterServerAdapter("openhands_gateway");
+    }
+  });
+
   it("materializes different pinned skill versions for different agents at runtime", async () => {
     const companyId = randomUUID();
     const skillId = randomUUID();
