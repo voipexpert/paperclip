@@ -55,7 +55,17 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): b
 }
 
 function boundedIdentifier(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= MAX_IDENTIFIER_BYTES;
+  return safeText(value, MAX_IDENTIFIER_BYTES);
+}
+
+function safeText(value: unknown, byteLimit: number, characterLimit?: number): value is string {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= byteLimit
+    && (characterLimit === undefined || Array.from(value).length <= characterLimit)
+    && value.normalize("NFC") === value && !/[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/.test(value);
+}
+
+function keyComponent(value: unknown): value is string {
+  return boundedIdentifier(value) && !value.includes(":");
 }
 
 function isLoopback(hostname: string): boolean {
@@ -123,10 +133,9 @@ export function parsePaperclipIssue(value: AdapterExecutionContext | Record<stri
   const input = record(value);
   const context = input && "context" in input ? record(input.context) : input;
   const issue = context ? record(context.paperclipIssue) : null;
-  if (!issue || !boundedIdentifier(issue.id) || !boundedIdentifier(issue.assigneeAgentId) || !boundedIdentifier(issue.projectId)
-    || (issue.status !== "todo" && issue.status !== "in_progress") || typeof issue.title !== "string"
-    || Array.from(issue.title).length > MAX_TITLE_CHARACTERS || typeof issue.description !== "string"
-    || Buffer.byteLength(issue.description, "utf8") > MAX_OBJECTIVE_BYTES) {
+  if (!issue || !keyComponent(issue.id) || !boundedIdentifier(issue.assigneeAgentId) || !boundedIdentifier(issue.projectId)
+    || (issue.status !== "todo" && issue.status !== "in_progress") || !safeText(issue.title, Number.MAX_SAFE_INTEGER, MAX_TITLE_CHARACTERS)
+    || !safeText(issue.description, MAX_OBJECTIVE_BYTES)) {
     return new ContractError("OPENHANDS_ISSUE");
   }
   return {
@@ -140,7 +149,7 @@ export function parsePaperclipIssue(value: AdapterExecutionContext | Record<stri
 }
 
 export function buildDispatch(context: Pick<AdapterExecutionContext, "runId" | "agent">, config: OpenHandsConfig, issue: PaperclipIssue): DispatchV1 {
-  if (!boundedIdentifier(context.runId) || !boundedIdentifier(context.agent.id)) throw new ContractError("OPENHANDS_ISSUE");
+  if (!keyComponent(context.runId) || !boundedIdentifier(context.agent.id)) throw new ContractError("OPENHANDS_ISSUE");
   const target = config.projectTargets[issue.projectId];
   if (!target) throw new ContractError("OPENHANDS_PROJECT");
   return {

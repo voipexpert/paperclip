@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -69,15 +70,23 @@ function context(port: number, overrides: Record<string, unknown> = {}) {
 }
 
 function completedEvidence() {
+  const branchDigest = createHash("sha256").update("task-1\0run-1", "utf8").digest("hex").slice(0, 20);
   return {
     version: 1,
     repository: "voipexpert/openhands-worker-acceptance",
     base_ref: "main",
-    branch: "openhands/pc-0123456789abcdef0123",
+    branch: `openhands/pc-${branchDigest}`,
     commit: "a".repeat(40),
     tests: [{ name: "pnpm test", status: "passed" }],
     draft_pr: { number: 1, url: "https://github.com/voipexpert/openhands-worker-acceptance/pull/1" },
     summary: "Bounded canary completed.",
+  };
+}
+
+function noChangeEvidence() {
+  return {
+    version: 1, outcome: "no_change", repository: "voipexpert/openhands-worker-acceptance", base_ref: "main",
+    commit: "b".repeat(40), tests: [{ name: "pnpm test", status: "passed" }], summary: "No change required.",
   };
 }
 
@@ -259,6 +268,20 @@ describe("OpenHands gateway contract", () => {
         resultJson: completedEvidence(),
       });
     } finally { await testGateway.close(); }
+  });
+
+  it("accepts the exact Hermes no-change success evidence union", async () => {
+    await setGatewayToken();
+    const testGateway = await gateway((socket) => {
+      socket.send(JSON.stringify({ type: "hello", version: 1 }));
+      socket.on("message", (raw) => {
+        const dispatch = JSON.parse(String(raw));
+        socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: true, duplicate: false, state: "accepted" }));
+        socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, status: "completed", result: noChangeEvidence() }));
+      });
+    });
+    try { await expect(execute(context(testGateway.port))).resolves.toMatchObject({ exitCode: 0, resultJson: noChangeEvidence() }); }
+    finally { await testGateway.close(); }
   });
 
   it("rejects wrong-version correlated frames and evidence keys outside the terminal allowlist", async () => {

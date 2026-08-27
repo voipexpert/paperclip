@@ -357,6 +357,8 @@ function isTerminalIssueRun(latestRun: LatestIssueRun) {
 }
 
 const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
+  "OPENHANDS_BUSY",
+  "OPENHANDS_PRE_DISPATCH_TIMEOUT",
   "adapter_failed",
   "codex_transient_upstream",
   "codex_harness_crash",

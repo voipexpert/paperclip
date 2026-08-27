@@ -1,4 +1,5 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { createHash } from "node:crypto";
 import { WebSocket } from "ws";
 import { ContractError, buildDispatch, parseOpenHandsConfig, parsePaperclipIssue, readGatewayToken } from "./contract.js";
 
@@ -12,7 +13,7 @@ const MAX_RESULT_ARRAY_ITEMS = 32;
 const MAX_RESULT_DEPTH = 4;
 const NONTERMINAL_STATES = new Set(["accepted", "preparing", "running", "testing", "draft_pr_created"]);
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "timed_out", "indeterminate"]);
-const FAILURE_CODES = new Set(["validation", "busy", "canvas_unavailable", "model_provider_failure", "timeout", "broker_rejection", "policy_rejection", "indeterminate"]);
+const FAILURE_CODES = new Set(["validation", "busy", "canvas_unavailable", "model_provider_failure", "timeout", "broker_rejection", "policy_rejection", "indeterminate", "evidence_rejection", "workspace_rejection", "protocol_rejection", "cancelled_by_request"]);
 const fixedMessages: Record<string, string> = {
   OPENHANDS_CONFIG: "OpenHands gateway configuration is invalid.",
   OPENHANDS_TOKEN: "OpenHands gateway credential is unavailable.",
@@ -27,6 +28,8 @@ const fixedMessages: Record<string, string> = {
   OPENHANDS_FAILED: "OpenHands gateway reported failure.",
   OPENHANDS_CANCELLED: "OpenHands gateway reported cancellation.",
   OPENHANDS_TIMEOUT: "OpenHands gateway timed out.",
+  OPENHANDS_PRE_DISPATCH_TIMEOUT: "OpenHands gateway timed out before dispatch.",
+  OPENHANDS_BUSY: "OpenHands gateway is busy.",
 };
 
 function result(code: string, timedOut = false): AdapterExecutionResult {
@@ -69,21 +72,28 @@ function isUtcTimestamp(value: unknown): boolean {
   return Number.isFinite(Date.parse(value));
 }
 
-function isCompletedEvidence(value: unknown, dispatch: { repository: string; baseRef: string }): value is Record<string, unknown> {
+function isCompletedEvidence(value: unknown, dispatch: { repository: string; baseRef: string; taskId: string; runId: string }): value is Record<string, unknown> {
   const evidence = frame(value);
-  if (!evidence || !hasExactKeys(evidence, ["version", "repository", "base_ref", "branch", "commit", "tests", "draft_pr", "summary"])
+  const noChange = !!evidence && hasExactKeys(evidence, ["version", "outcome", "repository", "base_ref", "commit", "tests", "summary"]);
+  if (!evidence || (!noChange && !hasExactKeys(evidence, ["version", "repository", "base_ref", "branch", "commit", "tests", "draft_pr", "summary"]))
     || evidence.version !== 1 || evidence.repository !== dispatch.repository || evidence.base_ref !== dispatch.baseRef
-    || !/^openhands\/pc-[0-9a-f]{20}$/.test(String(evidence.branch)) || !/^[0-9a-f]{40}$/.test(String(evidence.commit))
+    || !/^[0-9a-f]{40}$/.test(String(evidence.commit))
     || !boundedText(evidence.summary, 2_000)) return false;
+  if (noChange) {
+    if (evidence.outcome !== "no_change") return false;
+  } else {
+    const digest = createHash("sha256").update(`${dispatch.taskId}\0${dispatch.runId}`, "utf8").digest("hex").slice(0, 20);
+    if (evidence.branch !== `openhands/pc-${digest}`) return false;
+    const draft = frame(evidence.draft_pr);
+    if (!draft || !hasExactKeys(draft, ["number", "url"]) || !Number.isInteger(draft.number) || Number(draft.number) < 1
+      || draft.url !== `https://github.com/${dispatch.repository}/pull/${draft.number}`) return false;
+  }
   if (!Array.isArray(evidence.tests) || evidence.tests.length > MAX_RESULT_ARRAY_ITEMS) return false;
   if (!evidence.tests.every((test) => {
     const item = frame(test);
     return !!item && hasExactKeys(item, ["name", "status"]) && boundedText(item.name, 200, 200)
       && (item.status === "passed" || item.status === "failed" || item.status === "unknown");
   })) return false;
-  const draft = frame(evidence.draft_pr);
-  if (!draft || !hasExactKeys(draft, ["number", "url"]) || !Number.isInteger(draft.number) || Number(draft.number) < 1
-    || draft.url !== `https://github.com/${dispatch.repository}/pull/${draft.number}`) return false;
   try { return isBoundedResultValue(evidence) && Buffer.byteLength(JSON.stringify(evidence), "utf8") <= MAX_RESULT_BYTES; } catch { return false; }
 }
 
@@ -116,7 +126,7 @@ function isRunEvent(value: Record<string, unknown>): boolean {
     && NONTERMINAL_STATES.has(value.state) && isUtcTimestamp(value.timestamp);
 }
 
-function isRunResult(value: Record<string, unknown>, dispatch: { repository: string; baseRef: string }): boolean {
+function isRunResult(value: Record<string, unknown>, dispatch: { repository: string; baseRef: string; taskId: string; runId: string }): boolean {
   return hasExactKeys(value, ["type", "version", "runId", "taskId", "agentId", "status", "result"])
     && value.type === "run_result" && value.version === 1 && boundedFrameString(value.runId)
     && boundedFrameString(value.taskId) && boundedFrameString(value.agentId)
@@ -147,6 +157,7 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
     let dispatched = false;
     let dispatchSent = false;
     let acknowledged = false;
+    let acknowledgement: string | null = null;
     let cancellationStarted = false;
     let cancelWaitTimer: ReturnType<typeof setTimeout> | null = null;
     const finish = (value: AdapterExecutionResult) => {
@@ -154,7 +165,7 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
       settled = true;
       clearTimeout(deadlineTimer);
       if (cancelWaitTimer) clearTimeout(cancelWaitTimer);
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) socket.terminate();
+      if (socket.readyState !== WebSocket.CLOSED) { try { socket.terminate(); } catch { socket.close(); } }
       resolve(value);
     };
     const indeterminate = (reason = "post_dispatch_disconnect") => finish({
@@ -164,6 +175,7 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
     });
     const deadlineTimer = setTimeout(() => {
       if (settled) return;
+      if (!dispatchSent) { finish(result("OPENHANDS_PRE_DISPATCH_TIMEOUT", true)); return; }
       cancellationStarted = true;
       if (socket.readyState === WebSocket.OPEN) {
         try { socket.send(JSON.stringify({ type: "cancel", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId })); } catch { /* fixed timeout result below */ }
@@ -195,9 +207,11 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
       if (incoming.type === "dispatch_ack") {
         if (!isDispatchAck(incoming)) { finish(result("OPENHANDS_PROTOCOL")); return; }
         if (!matches(incoming, dispatch)) return;
-        if (incoming.accepted === false) { await context.onLog("stderr", "OpenHands gateway dispatch rejected.\n"); finish(result("OPENHANDS_REJECTED")); return; }
-        if (acknowledged) { finish(result("OPENHANDS_PROTOCOL")); return; }
+        if (incoming.accepted === false) { await context.onLog("stderr", "OpenHands gateway dispatch rejected.\n"); finish(result(incoming.reason === "busy" ? "OPENHANDS_BUSY" : "OPENHANDS_REJECTED")); return; }
+        const signature = JSON.stringify(incoming);
+        if (acknowledged) { if (signature !== acknowledgement) finish(result("OPENHANDS_PROTOCOL")); return; }
         acknowledged = true;
+        acknowledgement = signature;
         await context.onLog("stdout", "OpenHands gateway dispatch accepted.\n");
         return;
       }
