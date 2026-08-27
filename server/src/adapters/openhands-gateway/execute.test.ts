@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { fstatSync } from "node:fs";
 import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -12,11 +13,45 @@ import {
   parsePaperclipIssue,
   readGatewayToken,
 } from "./contract.js";
-import { execute } from "./execute.js";
+import { execute as executeAdapter } from "./execute.js";
+import { agentConfigurationDoc } from "./index.js";
+import { testEnvironment } from "./test.js";
 
 const tokenDirectories: string[] = [];
 const originalTokenFile = process.env.OPENHANDS_GATEWAY_TOKEN_FILE;
 const TOKEN = "a".repeat(64);
+const TOKEN_GID = 4242;
+
+function credentialSecurity(overrides: {
+  uid?: number;
+  gid?: number;
+  groups?: number[];
+  tokenUid?: number;
+  tokenGid?: number;
+  tokenMode?: number;
+} = {}) {
+  return {
+    processUid: overrides.uid ?? 1000,
+    processGid: overrides.gid ?? 1000,
+    processGroups: overrides.groups ?? [TOKEN_GID],
+    inspect(descriptor: number) {
+      const value = fstatSync(descriptor);
+      return {
+        isFile: value.isFile(),
+        mode: overrides.tokenMode ?? value.mode,
+        uid: overrides.tokenUid ?? 0,
+        gid: overrides.tokenGid ?? TOKEN_GID,
+        size: value.size,
+        dev: value.dev,
+        ino: value.ino,
+        nlink: value.nlink,
+        mtimeMs: value.mtimeMs,
+      };
+    },
+  };
+}
+
+const execute = (value: Parameters<typeof executeAdapter>[0]) => executeAdapter(value, credentialSecurity());
 
 afterEach(async () => {
   if (originalTokenFile === undefined) delete process.env.OPENHANDS_GATEWAY_TOKEN_FILE;
@@ -24,7 +59,7 @@ afterEach(async () => {
   await Promise.all(tokenDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-async function setGatewayToken(value = TOKEN, mode = 0o600): Promise<void> {
+async function setGatewayToken(value = TOKEN, mode = 0o640): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "openhands-gateway-"));
   tokenDirectories.push(directory);
   const tokenFile = join(directory, "token");
@@ -108,9 +143,9 @@ async function gateway(handler: (socket: import("ws").WebSocket, request: import
 }
 
 describe("OpenHands gateway contract", () => {
-  it("reads only a mode-0600 token file and builds dispatch exclusively from mapped project fields", async () => {
+  it("reads only the Plane group credential and builds dispatch exclusively from mapped project fields", async () => {
     await setGatewayToken();
-    const token = readGatewayToken(process.env);
+    const token = readGatewayToken(process.env, credentialSecurity());
     assert.equal(token, TOKEN);
 
     const settings = parseOpenHandsConfig({
@@ -137,36 +172,75 @@ describe("OpenHands gateway contract", () => {
     });
   });
 
+  it("requires the exact nonroot runtime and root-owned dedicated supplemental-group credential", async () => {
+    await setGatewayToken();
+    expect(readGatewayToken(process.env, credentialSecurity())).toBe(TOKEN);
+    for (const security of [
+      credentialSecurity({ uid: 0 }),
+      credentialSecurity({ uid: 1001 }),
+      credentialSecurity({ gid: 0 }),
+      credentialSecurity({ gid: 1001 }),
+      credentialSecurity({ groups: [] }),
+      credentialSecurity({ groups: [TOKEN_GID + 1] }),
+      credentialSecurity({ tokenUid: 1000 }),
+      credentialSecurity({ tokenGid: 0 }),
+      credentialSecurity({ tokenGid: 1000, groups: [1000] }),
+      credentialSecurity({ tokenMode: 0o600 }),
+      credentialSecurity({ tokenMode: 0o644 }),
+      credentialSecurity({ tokenMode: 0o660 }),
+    ]) {
+      expect(readGatewayToken(process.env, security)).toBeInstanceOf(Error);
+    }
+  });
+
+  it("documents the exact Plane credential and runtime identity boundary", () => {
+    expect(agentConfigurationDoc).toContain("root-owned mode-0640");
+    expect(agentConfigurationDoc).toContain("UID/GID 1000:1000");
+    expect(agentConfigurationDoc).toContain("supplemental group");
+    expect(agentConfigurationDoc).not.toContain("mode-0600");
+  });
+
+  it("passes the environment check with the reviewed Plane credential contract", async () => {
+    await setGatewayToken();
+    const remote = await gateway((socket) => socket.send(JSON.stringify({ type: "hello", version: 1 })));
+    try {
+      const result = await testEnvironment({ config: context(remote.port).config } as never, credentialSecurity());
+      expect(result).toMatchObject({ adapterType: "openhands_gateway", status: "pass" });
+    } finally {
+      await remote.close();
+    }
+  });
+
   it("preserves exact gateway credential bytes and rejects whitespace framing", async () => {
     await setGatewayToken(TOKEN);
-    expect(readGatewayToken(process.env)).toBe(TOKEN);
+    expect(readGatewayToken(process.env, credentialSecurity())).toBe(TOKEN);
     for (const token of [`${TOKEN}\r`, `${TOKEN}\n`, ` ${TOKEN}`, `${TOKEN} `, `\t${TOKEN}`, `${TOKEN}\t`]) {
       await setGatewayToken(token);
-      expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
+      expect(readGatewayToken(process.env, credentialSecurity())).toBeInstanceOf(Error);
     }
   });
 
   it("rejects malformed or BOM-framed UTF-8 credentials without normalizing valid decomposed text", async () => {
     await setGatewayToken(TOKEN);
-    expect(readGatewayToken(process.env)).toBe(TOKEN);
+    expect(readGatewayToken(process.env, credentialSecurity())).toBe(TOKEN);
     const tokenDirectory = tokenDirectories.at(-1)!;
     for (const [name, bytes] of [["bom", Buffer.from([0xef, 0xbb, 0xbf, 0x74])], ["malformed", Buffer.from([0xc3, 0x28])]] as const) {
       const tokenFile = join(tokenDirectory, name);
-      await writeFile(tokenFile, bytes, { mode: 0o600 });
-      await chmod(tokenFile, 0o600);
+      await writeFile(tokenFile, bytes, { mode: 0o640 });
+      await chmod(tokenFile, 0o640);
       process.env.OPENHANDS_GATEWAY_TOKEN_FILE = tokenFile;
-      expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
+      expect(readGatewayToken(process.env, credentialSecurity())).toBeInstanceOf(Error);
     }
   });
 
   it("accepts only exact lowercase 64-hex credential vectors", async () => {
     for (const token of ["b".repeat(64), "0".repeat(64)]) {
       await setGatewayToken(token);
-      expect(readGatewayToken(process.env)).toBe(token);
+      expect(readGatewayToken(process.env, credentialSecurity())).toBe(token);
     }
     for (const token of ["a".repeat(63), "a".repeat(65), "A".repeat(64), `${"a".repeat(63)}g`]) {
       await setGatewayToken(token);
-      expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
+      expect(readGatewayToken(process.env, credentialSecurity())).toBeInstanceOf(Error);
     }
   });
 
@@ -182,17 +256,17 @@ describe("OpenHands gateway contract", () => {
 
   it("rejects unsafe tokens and all invalid config or issue input", async () => {
     await setGatewayToken("test-token", 0o644);
-    expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
+    expect(readGatewayToken(process.env, credentialSecurity())).toBeInstanceOf(Error);
     const tokenDirectory = tokenDirectories.at(-1)!;
     const emptyToken = join(tokenDirectory, "empty-token");
     const oversizedToken = join(tokenDirectory, "oversized-token");
     const tokenLink = join(tokenDirectory, "token-link");
-    await writeFile(emptyToken, "", { mode: 0o600 });
-    await writeFile(oversizedToken, "x".repeat(4_097), { mode: 0o600 });
+    await writeFile(emptyToken, "", { mode: 0o640 });
+    await writeFile(oversizedToken, "x".repeat(4_097), { mode: 0o640 });
     await symlink(join(tokenDirectory, "token"), tokenLink);
     for (const tokenFile of [emptyToken, oversizedToken, tokenLink]) {
       process.env.OPENHANDS_GATEWAY_TOKEN_FILE = tokenFile;
-      expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
+      expect(readGatewayToken(process.env, credentialSecurity())).toBeInstanceOf(Error);
     }
 
     const validConfig = {

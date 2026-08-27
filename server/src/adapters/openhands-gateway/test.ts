@@ -1,14 +1,14 @@
 import type { AdapterEnvironmentTestContext, AdapterEnvironmentTestResult } from "@paperclipai/adapter-utils";
 import { WebSocket, type RawData } from "ws";
-import { ContractError, parseOpenHandsConfig, readGatewayToken } from "./contract.js";
+import { ContractError, parseOpenHandsConfig, readGatewayToken, type GatewayCredentialSecurityContext } from "./contract.js";
 
 function failure(code: string): AdapterEnvironmentTestResult {
   return { adapterType: "openhands_gateway", status: "fail", testedAt: new Date().toISOString(), checks: [{ code, level: "error", message: "OpenHands gateway environment check failed." }] };
 }
 
-export async function testEnvironment(context: AdapterEnvironmentTestContext): Promise<AdapterEnvironmentTestResult> {
+export async function testEnvironment(context: AdapterEnvironmentTestContext, credentialSecurity?: GatewayCredentialSecurityContext): Promise<AdapterEnvironmentTestResult> {
   const config = parseOpenHandsConfig(context.config);
-  const token = readGatewayToken(process.env);
+  const token = readGatewayToken(process.env, credentialSecurity);
   if (config instanceof ContractError) return failure("OPENHANDS_ENV_CONFIG");
   if (token instanceof ContractError) return failure("OPENHANDS_ENV_TOKEN");
   try {

@@ -1,7 +1,7 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
 import { WebSocket } from "ws";
-import { ContractError, buildDispatch, parseOpenHandsConfig, parsePaperclipIssue, readGatewayToken } from "./contract.js";
+import { ContractError, buildDispatch, parseOpenHandsConfig, parsePaperclipIssue, readGatewayToken, type GatewayCredentialSecurityContext } from "./contract.js";
 
 const MAX_PAYLOAD = 64 * 1024;
 const CANCEL_ACK_WAIT_MS = 5_000;
@@ -162,10 +162,10 @@ function canonicalFrame(value: unknown): string {
   return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalFrame(object[key])}`).join(",")}}`;
 }
 
-export async function execute(context: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+export async function execute(context: AdapterExecutionContext, credentialSecurity?: GatewayCredentialSecurityContext): Promise<AdapterExecutionResult> {
   const config = parseOpenHandsConfig(context);
   if (config instanceof ContractError) return result(config.code);
-  const token = readGatewayToken(process.env);
+  const token = readGatewayToken(process.env, credentialSecurity);
   if (token instanceof ContractError) return result(token.code);
   const issue = parsePaperclipIssue(context);
   if (issue instanceof ContractError) return result(issue.code);

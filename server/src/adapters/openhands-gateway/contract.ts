@@ -44,6 +44,41 @@ const MAX_URL_BYTES = 2_048;
 const MIN_TIMEOUT_SEC = 60;
 const MAX_TIMEOUT_SEC = 7_200;
 
+type GatewayCredentialStat = {
+  isFile: boolean;
+  mode: number;
+  uid: number;
+  gid: number;
+  size: number;
+  dev: number;
+  ino: number;
+  nlink: number;
+  mtimeMs: number;
+};
+
+export type GatewayCredentialSecurityContext = {
+  processUid: number;
+  processGid: number;
+  processGroups: readonly number[];
+  inspect(descriptor: number): GatewayCredentialStat;
+};
+
+function productionCredentialSecurityContext(): GatewayCredentialSecurityContext {
+  const inspect = (descriptor: number): GatewayCredentialStat => {
+    const value = fstatSync(descriptor);
+    return {
+      isFile: value.isFile(), mode: value.mode, uid: value.uid, gid: value.gid,
+      size: value.size, dev: value.dev, ino: value.ino, nlink: value.nlink, mtimeMs: value.mtimeMs,
+    };
+  };
+  return {
+    processUid: process.getuid?.() ?? -1,
+    processGid: process.getgid?.() ?? -1,
+    processGroups: process.getgroups?.() ?? [],
+    inspect,
+  };
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -119,17 +154,29 @@ export function parseOpenHandsConfig(value: AdapterExecutionContext | Record<str
   };
 }
 
-export function readGatewayToken(env: NodeJS.ProcessEnv): string | ContractError {
+export function readGatewayToken(
+  env: NodeJS.ProcessEnv,
+  security: GatewayCredentialSecurityContext = productionCredentialSecurityContext(),
+): string | ContractError {
   const tokenFile = env.OPENHANDS_GATEWAY_TOKEN_FILE;
   if (!tokenFile) return new ContractError("OPENHANDS_TOKEN");
   let descriptor: number | null = null;
   try {
     descriptor = openSync(tokenFile, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const stat = fstatSync(descriptor);
-    if (!stat.isFile() || (stat.mode & 0o777) !== 0o600 || stat.size === 0 || stat.size > MAX_TOKEN_BYTES) {
+    const before = security.inspect(descriptor);
+    if (security.processUid !== 1000 || security.processGid !== 1000
+      || !before.isFile || before.uid !== 0 || !Number.isSafeInteger(before.gid) || before.gid <= 0 || before.gid === security.processGid
+      || !security.processGroups.includes(before.gid)
+      || (before.mode & 0o777) !== 0o640 || before.size !== MAX_TOKEN_BYTES) {
       return new ContractError("OPENHANDS_TOKEN");
     }
     const bytes = readFileSync(descriptor);
+    const after = security.inspect(descriptor);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.mode !== after.mode
+      || before.uid !== after.uid || before.gid !== after.gid || before.nlink !== after.nlink
+      || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+      return new ContractError("OPENHANDS_TOKEN");
+    }
     const token = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
     return /^[0-9a-f]{64}$/.test(token) && !token.startsWith("\ufeff") && Buffer.from(token, "utf8").equals(bytes)
       && !/[\r\n]/.test(token) && !/^\s|\s$/u.test(token)
