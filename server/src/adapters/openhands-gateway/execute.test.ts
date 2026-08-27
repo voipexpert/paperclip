@@ -238,7 +238,7 @@ describe("OpenHands gateway contract", () => {
     }
   });
 
-  it("ignores only core-injected runtime skills in the live execution context", async () => {
+  it("rejects runtime skills and every unknown key when execute is called directly", async () => {
     await setGatewayToken();
     const base = context(1);
     const runtimeSkills = [{ key: "company/review", runtimeName: "review", source: "managed" }];
@@ -248,7 +248,7 @@ describe("OpenHands gateway contract", () => {
     };
 
     expect(parseOpenHandsConfig(liveContext.config)).toBeInstanceOf(Error);
-    await expect(execute(liveContext)).resolves.toMatchObject({ errorCode: "OPENHANDS_UNREACHABLE" });
+    await expect(execute(liveContext)).resolves.toMatchObject({ errorCode: "OPENHANDS_CONFIG" });
 
     const unknownContext = {
       ...liveContext,

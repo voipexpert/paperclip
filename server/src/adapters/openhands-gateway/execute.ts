@@ -163,9 +163,7 @@ function canonicalFrame(value: unknown): string {
 }
 
 export async function execute(context: AdapterExecutionContext, credentialSecurity?: GatewayCredentialSecurityContext): Promise<AdapterExecutionResult> {
-  const executionConfig = { ...context.config };
-  delete executionConfig.paperclipRuntimeSkills;
-  const config = parseOpenHandsConfig(executionConfig);
+  const config = parseOpenHandsConfig(context);
   if (config instanceof ContractError) return result(config.code);
   const token = readGatewayToken(process.env, credentialSecurity);
   if (token instanceof ContractError) return result(token.code);

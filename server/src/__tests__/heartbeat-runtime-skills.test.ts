@@ -23,13 +23,31 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { companySkillService } from "../services/company-skills.ts";
-import { heartbeatService } from "../services/heartbeat.ts";
+import { heartbeatService, runtimeConfigForAdapterExecution } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const TEST_ADAPTER_TYPE = "runtime_skill_capture";
+
+describe("heartbeat adapter runtime config boundary", () => {
+  it("omits only core runtime skills for OpenHands and preserves them for other adapters", () => {
+    const runtimeSkills = [{ key: "company/review", runtimeName: "review", source: "managed" }];
+    const runtimeConfig = {
+      url: "wss://gateway.example/paperclip-worker/v1",
+      paperclipRuntimeSkills: runtimeSkills,
+      operatorUnknown: true,
+    };
+
+    expect(runtimeConfigForAdapterExecution("openhands_gateway", runtimeConfig)).toEqual({
+      url: runtimeConfig.url,
+      operatorUnknown: true,
+    });
+    expect(runtimeConfigForAdapterExecution(TEST_ADAPTER_TYPE, runtimeConfig)).toBe(runtimeConfig);
+    expect(runtimeConfig.paperclipRuntimeSkills).toBe(runtimeSkills);
+  });
+});
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
