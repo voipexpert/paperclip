@@ -27,6 +27,72 @@ test("dispatches a Paperclip run and completes only on its matching terminal eve
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
+test("reports durable queue admission and completes on its matching terminal event", async () => {
+  const server = new WebSocketServer({ port: 0 });
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const port = (server.address() as { port: number }).port;
+  server.on("connection", (socket) => {
+    socket.send(JSON.stringify({ type: "hello", role: "events" }));
+    socket.on("message", (raw) => {
+      const frame = JSON.parse(String(raw));
+      if (frame.type !== "paperclip.dispatch") return;
+      socket.send(JSON.stringify({ type: "paperclip.dispatch_ack", runId: frame.runId, accepted: true, state: "queued", position: 2 }));
+      socket.send(JSON.stringify({ type: "paperclip.run_event", runId: frame.runId, agentId: frame.agentId, kind: "completed", message: "done" }));
+    });
+  });
+
+  const logs: string[] = [];
+  const result = await execute({
+    runId: "run-queued",
+    agent: { id: "agent-1", companyId: "company-1", name: "FirstMate", adapterType: "firstmate_gateway", adapterConfig: {} },
+    runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+    config: { url: `ws://127.0.0.1:${port}/events`, authToken: "test-token", timeoutSec: 3 },
+    context: { task: { id: "task-1", title: "Test" } },
+    onLog: async (_stream, output) => { logs.push(output); },
+  });
+
+  assert.ok(logs.includes("FirstMate queued Paperclip run at position 2.\n"));
+  assert.equal(result.exitCode, 0);
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
+test.each([
+  ["legacy acknowledgement", {}],
+  ["non-queued state", { state: "accepted", position: 2 }],
+  ["zero position", { state: "queued", position: 0 }],
+  ["negative position", { state: "queued", position: -1 }],
+  ["fractional position", { state: "queued", position: 1.5 }],
+  ["unsafe integer position", { state: "queued", position: Number.MAX_SAFE_INTEGER + 1 }],
+  ["numeric string position", { state: "queued", position: "2" }],
+])("keeps the legacy acknowledgement log for %s", async (_caseName, acknowledgement) => {
+  const server = new WebSocketServer({ port: 0 });
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const port = (server.address() as { port: number }).port;
+  server.on("connection", (socket) => {
+    socket.send(JSON.stringify({ type: "hello", role: "events" }));
+    socket.on("message", (raw) => {
+      const frame = JSON.parse(String(raw));
+      if (frame.type !== "paperclip.dispatch") return;
+      socket.send(JSON.stringify({ type: "paperclip.dispatch_ack", runId: frame.runId, accepted: true, ...acknowledgement }));
+      socket.send(JSON.stringify({ type: "paperclip.run_event", runId: frame.runId, agentId: frame.agentId, kind: "completed", message: "done" }));
+    });
+  });
+
+  const logs: string[] = [];
+  const result = await execute({
+    runId: "run-legacy",
+    agent: { id: "agent-1", companyId: "company-1", name: "FirstMate", adapterType: "firstmate_gateway", adapterConfig: {} },
+    runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+    config: { url: `ws://127.0.0.1:${port}/events`, authToken: "test-token", timeoutSec: 3 },
+    context: { task: { id: "task-1", title: "Test" } },
+    onLog: async (_stream, output) => { logs.push(output); },
+  });
+
+  assert.ok(logs.includes("FirstMate accepted Paperclip run.\n"));
+  assert.equal(result.exitCode, 0);
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
 test("uses a stable synthetic task ID for a taskless heartbeat", async () => {
   const server = new WebSocketServer({ port: 0 });
   await new Promise<void>((resolve) => server.once("listening", resolve));
