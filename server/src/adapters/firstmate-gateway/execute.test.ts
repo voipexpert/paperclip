@@ -62,6 +62,7 @@ test.each([
   ["zero position", { state: "queued", position: 0 }],
   ["negative position", { state: "queued", position: -1 }],
   ["fractional position", { state: "queued", position: 1.5 }],
+  ["unsafe integer position", { state: "queued", position: Number.MAX_SAFE_INTEGER + 1 }],
   ["numeric string position", { state: "queued", position: "2" }],
 ])("keeps the legacy acknowledgement log for %s", async (_caseName, acknowledgement) => {
   const server = new WebSocketServer({ port: 0 });

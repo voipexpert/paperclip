@@ -46,7 +46,7 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
       if (frame.type === "paperclip.dispatch_ack" && frame.runId === context.runId) {
         if (frame.accepted === true) {
           acknowledged = true;
-          const queuePosition = typeof frame.position === "number" && Number.isInteger(frame.position) && frame.position > 0
+          const queuePosition = typeof frame.position === "number" && Number.isSafeInteger(frame.position) && frame.position > 0
             ? frame.position
             : null;
           const acknowledgement = frame.state === "queued" && queuePosition
