@@ -129,8 +129,9 @@ export function readGatewayToken(env: NodeJS.ProcessEnv): string | ContractError
     if (!stat.isFile() || (stat.mode & 0o777) !== 0o600 || stat.size === 0 || stat.size > MAX_TOKEN_BYTES) {
       return new ContractError("OPENHANDS_TOKEN");
     }
-    const token = readFileSync(descriptor, "utf8").trim();
+    const token = readFileSync(descriptor, "utf8");
     return token.length > 0 && Buffer.byteLength(token, "utf8") <= MAX_TOKEN_BYTES
+      && !/[\r\n]/.test(token) && !/^\s|\s$/u.test(token)
       ? token
       : new ContractError("OPENHANDS_TOKEN");
   } catch {

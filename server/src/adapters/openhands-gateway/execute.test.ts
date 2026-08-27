@@ -136,6 +136,15 @@ describe("OpenHands gateway contract", () => {
     });
   });
 
+  it("preserves exact gateway credential bytes and rejects whitespace framing", async () => {
+    await setGatewayToken("exact-token");
+    expect(readGatewayToken(process.env)).toBe("exact-token");
+    for (const token of ["exact-token\r", "exact-token\n", " exact-token", "exact-token ", "\texact-token", "exact-token\t"]) {
+      await setGatewayToken(token);
+      expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
+    }
+  });
+
   it("accepts the existing redacted heartbeat issue fields alongside the OpenHands contract fields", () => {
     const issue = parsePaperclipIssue({
       paperclipIssue: {
