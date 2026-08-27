@@ -36,6 +36,7 @@ import {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
+const OPENHANDS_AMBIGUITY_TEST_ADAPTER = "openhands_ambiguity_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -89,6 +90,24 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
+    registerServerAdapter({
+      type: OPENHANDS_AMBIGUITY_TEST_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: true,
+        errorCode: "OPENHANDS_TIMEOUT",
+        errorMessage: "OpenHands gateway timed out.",
+        clearSession: false,
+        resultJson: { state: "indeterminate", reason: "cancel_unacknowledged" },
+      }),
+      testEnvironment: async () => ({
+        adapterType: OPENHANDS_AMBIGUITY_TEST_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
   }, 20_000);
 
   afterEach(async () => {
@@ -104,6 +123,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
   afterAll(async () => {
     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
+    unregisterServerAdapter(OPENHANDS_AMBIGUITY_TEST_ADAPTER);
     await tempDb?.cleanup();
   });
 
@@ -293,6 +313,28 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         { timeout: 5_000, interval: 50 },
       )
       .toEqual({ status: "idle", errorReason: null });
+  });
+
+  it("persists a post-dispatch OpenHands ambiguity code and creates no continuation run", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId, name: "Paperclip", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "OpenHands", role: "engineer", status: "idle",
+      adapterType: OPENHANDS_AMBIGUITY_TEST_ADAPTER, adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {},
+    });
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(failedRun).toMatchObject({ status: "timed_out", errorCode: "OPENHANDS_TIMEOUT" });
+    expect(failedRun?.resultJson).toMatchObject({ state: "indeterminate", reason: "cancel_unacknowledged" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await expect(db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run!.id))).resolves.toEqual([]);
   });
 
   async function seedMaxTurnFixture(input?: {

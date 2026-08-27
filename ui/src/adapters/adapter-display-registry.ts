@@ -136,6 +136,11 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     description: "Primary coding executor via the FirstMate relay",
     icon: Bot,
   },
+  openhands_gateway: {
+    label: "OpenHands Gateway",
+    description: "Independent OpenHands programmer on VM103",
+    icon: Bot,
+  },
   process: {
     label: "Process",
     description: "Internal process adapter",
