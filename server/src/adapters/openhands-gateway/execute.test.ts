@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { fstatSync } from "node:fs";
-import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,18 +29,26 @@ function credentialSecurity(overrides: {
   tokenUid?: number;
   tokenGid?: number;
   tokenMode?: number;
+  afterTokenGid?: number;
+  afterTokenMode?: number;
 } = {}) {
+  let inspections = 0;
   return {
     processUid: overrides.uid ?? 1000,
     processGid: overrides.gid ?? 1000,
     processGroups: overrides.groups ?? [TOKEN_GID],
     inspect(descriptor: number) {
+      inspections += 1;
       const value = fstatSync(descriptor);
       return {
         isFile: value.isFile(),
-        mode: overrides.tokenMode ?? value.mode,
+        mode: inspections > 1 && overrides.afterTokenMode !== undefined
+          ? overrides.afterTokenMode
+          : overrides.tokenMode ?? value.mode,
         uid: overrides.tokenUid ?? 0,
-        gid: overrides.tokenGid ?? TOKEN_GID,
+        gid: inspections > 1 && overrides.afterTokenGid !== undefined
+          ? overrides.afterTokenGid
+          : overrides.tokenGid ?? TOKEN_GID,
         size: value.size,
         dev: value.dev,
         ino: value.ino,
@@ -191,6 +199,25 @@ describe("OpenHands gateway contract", () => {
     ]) {
       expect(readGatewayToken(process.env, security)).toBeInstanceOf(Error);
     }
+  });
+
+  it("rejects special permission bits and multiply-linked credential inodes", async () => {
+    for (const mode of [0o1640, 0o2640, 0o4640, 0o7640]) {
+      await setGatewayToken(TOKEN, mode);
+      expect(readGatewayToken(process.env, credentialSecurity())).toBeInstanceOf(Error);
+    }
+    await setGatewayToken();
+    const tokenFile = process.env.OPENHANDS_GATEWAY_TOKEN_FILE!;
+    const linkedToken = join(tokenDirectories.at(-1)!, "linked-token");
+    await link(tokenFile, linkedToken);
+    process.env.OPENHANDS_GATEWAY_TOKEN_FILE = linkedToken;
+    expect(readGatewayToken(process.env, credentialSecurity())).toBeInstanceOf(Error);
+  });
+
+  it("rejects credential metadata drift between descriptor inspections", async () => {
+    await setGatewayToken();
+    expect(readGatewayToken(process.env, credentialSecurity({ afterTokenMode: 0o600 }))).toBeInstanceOf(Error);
+    expect(readGatewayToken(process.env, credentialSecurity({ afterTokenGid: TOKEN_GID + 1 }))).toBeInstanceOf(Error);
   });
 
   it("documents the exact Plane credential and runtime identity boundary", () => {

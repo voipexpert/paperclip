@@ -167,7 +167,7 @@ export function readGatewayToken(
     if (security.processUid !== 1000 || security.processGid !== 1000
       || !before.isFile || before.uid !== 0 || !Number.isSafeInteger(before.gid) || before.gid <= 0 || before.gid === security.processGid
       || !security.processGroups.includes(before.gid)
-      || (before.mode & 0o777) !== 0o640 || before.size !== MAX_TOKEN_BYTES) {
+      || (before.mode & 0o7777) !== 0o640 || before.nlink !== 1 || before.size !== MAX_TOKEN_BYTES) {
       return new ContractError("OPENHANDS_TOKEN");
     }
     const bytes = readFileSync(descriptor);
