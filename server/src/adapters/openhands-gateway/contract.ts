@@ -39,7 +39,7 @@ export class ContractError extends Error {
 const MAX_IDENTIFIER_BYTES = 128;
 const MAX_TITLE_CHARACTERS = 300;
 const MAX_OBJECTIVE_BYTES = 20_000;
-const MAX_TOKEN_BYTES = 4_096;
+const MAX_TOKEN_BYTES = 64;
 const MAX_URL_BYTES = 2_048;
 const MIN_TIMEOUT_SEC = 60;
 const MAX_TIMEOUT_SEC = 7_200;
@@ -131,8 +131,7 @@ export function readGatewayToken(env: NodeJS.ProcessEnv): string | ContractError
     }
     const bytes = readFileSync(descriptor);
     const token = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-    return token.length > 0 && !token.startsWith("\ufeff") && Buffer.from(token, "utf8").equals(bytes)
-      && Buffer.byteLength(token, "utf8") <= MAX_TOKEN_BYTES
+    return /^[0-9a-f]{64}$/.test(token) && !token.startsWith("\ufeff") && Buffer.from(token, "utf8").equals(bytes)
       && !/[\r\n]/.test(token) && !/^\s|\s$/u.test(token)
       ? token
       : new ContractError("OPENHANDS_TOKEN");

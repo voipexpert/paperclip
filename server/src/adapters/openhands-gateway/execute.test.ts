@@ -16,6 +16,7 @@ import { execute } from "./execute.js";
 
 const tokenDirectories: string[] = [];
 const originalTokenFile = process.env.OPENHANDS_GATEWAY_TOKEN_FILE;
+const TOKEN = "a".repeat(64);
 
 afterEach(async () => {
   if (originalTokenFile === undefined) delete process.env.OPENHANDS_GATEWAY_TOKEN_FILE;
@@ -23,7 +24,7 @@ afterEach(async () => {
   await Promise.all(tokenDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-async function setGatewayToken(value = "test-token", mode = 0o600): Promise<void> {
+async function setGatewayToken(value = TOKEN, mode = 0o600): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "openhands-gateway-"));
   tokenDirectories.push(directory);
   const tokenFile = join(directory, "token");
@@ -110,7 +111,7 @@ describe("OpenHands gateway contract", () => {
   it("reads only a mode-0600 token file and builds dispatch exclusively from mapped project fields", async () => {
     await setGatewayToken();
     const token = readGatewayToken(process.env);
-    assert.equal(token, "test-token");
+    assert.equal(token, TOKEN);
 
     const settings = parseOpenHandsConfig({
       url: "wss://gateway.example/paperclip-worker/v1",
@@ -137,23 +138,34 @@ describe("OpenHands gateway contract", () => {
   });
 
   it("preserves exact gateway credential bytes and rejects whitespace framing", async () => {
-    await setGatewayToken("exact-token");
-    expect(readGatewayToken(process.env)).toBe("exact-token");
-    for (const token of ["exact-token\r", "exact-token\n", " exact-token", "exact-token ", "\texact-token", "exact-token\t"]) {
+    await setGatewayToken(TOKEN);
+    expect(readGatewayToken(process.env)).toBe(TOKEN);
+    for (const token of [`${TOKEN}\r`, `${TOKEN}\n`, ` ${TOKEN}`, `${TOKEN} `, `\t${TOKEN}`, `${TOKEN}\t`]) {
       await setGatewayToken(token);
       expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
     }
   });
 
   it("rejects malformed or BOM-framed UTF-8 credentials without normalizing valid decomposed text", async () => {
-    await setGatewayToken("decomposed-e\u0301-token");
-    expect(readGatewayToken(process.env)).toBe("decomposed-e\u0301-token");
+    await setGatewayToken(TOKEN);
+    expect(readGatewayToken(process.env)).toBe(TOKEN);
     const tokenDirectory = tokenDirectories.at(-1)!;
     for (const [name, bytes] of [["bom", Buffer.from([0xef, 0xbb, 0xbf, 0x74])], ["malformed", Buffer.from([0xc3, 0x28])]] as const) {
       const tokenFile = join(tokenDirectory, name);
       await writeFile(tokenFile, bytes, { mode: 0o600 });
       await chmod(tokenFile, 0o600);
       process.env.OPENHANDS_GATEWAY_TOKEN_FILE = tokenFile;
+      expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
+    }
+  });
+
+  it("accepts only exact lowercase 64-hex credential vectors", async () => {
+    for (const token of ["b".repeat(64), "0".repeat(64)]) {
+      await setGatewayToken(token);
+      expect(readGatewayToken(process.env)).toBe(token);
+    }
+    for (const token of ["a".repeat(63), "a".repeat(65), "A".repeat(64), `${"a".repeat(63)}g`]) {
+      await setGatewayToken(token);
       expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
     }
   });
@@ -238,7 +250,7 @@ describe("OpenHands gateway contract", () => {
     const logs: Array<[string, string]> = [];
     const received: Record<string, unknown>[] = [];
     const testGateway = await gateway((socket, request) => {
-      assert.equal(request.headers.authorization, "Bearer test-token");
+      assert.equal(request.headers.authorization, `Bearer ${TOKEN}`);
       socket.send(JSON.stringify({ type: "hello", version: 1 }));
       socket.send(JSON.stringify({ type: "hello", version: 1 }));
       socket.on("message", (raw) => {
