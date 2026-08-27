@@ -1312,6 +1312,16 @@ export function applyRunScopedMentionedSkillKeys(
   ]);
 }
 
+export function runtimeConfigForAdapterExecution(
+  adapterType: string,
+  runtimeConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  if (adapterType !== "openhands_gateway") return runtimeConfig;
+  const executionConfig = { ...runtimeConfig };
+  delete executionConfig.paperclipRuntimeSkills;
+  return executionConfig;
+}
+
 export function computeBoundedTransientHeartbeatRetrySchedule(
   attempt: number,
   now = new Date(),
@@ -16180,6 +16190,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
         const adapterContext = { ...context };
+        const adapterRuntimeConfig = runtimeConfigForAdapterExecution(agent.adapterType, runtimeConfig);
         const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
           db,
           agent,
@@ -16201,9 +16212,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           runId: run.id,
           agent,
           runtime: runtimeForAdapter,
-          config: runtimeConfig,
+          config: adapterRuntimeConfig,
           context: adapterContext,
-          runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
+          runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(adapterRuntimeConfig) ?? null,
           executionTarget,
           executionTransport: remoteExecution
             ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }

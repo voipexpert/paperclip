@@ -238,6 +238,29 @@ describe("OpenHands gateway contract", () => {
     }
   });
 
+  it("rejects runtime skills when execute is called directly", async () => {
+    await setGatewayToken();
+    const base = context(1);
+    const runtimeSkills = [{ key: "company/review", runtimeName: "review", source: "managed" }];
+    const liveContext = {
+      ...base,
+      config: { ...base.config, paperclipRuntimeSkills: runtimeSkills },
+    };
+
+    expect(parseOpenHandsConfig(liveContext.config)).toBeInstanceOf(Error);
+    await expect(execute(liveContext)).resolves.toMatchObject({ errorCode: "OPENHANDS_CONFIG" });
+  });
+
+  it("rejects an operator unknown key when execute is called directly", async () => {
+    await setGatewayToken();
+    const base = context(1);
+    const unknownContext = {
+      ...base,
+      config: { ...base.config, operatorUnknown: true },
+    };
+    await expect(execute(unknownContext)).resolves.toMatchObject({ errorCode: "OPENHANDS_CONFIG" });
+  });
+
   it("preserves exact gateway credential bytes and rejects whitespace framing", async () => {
     await setGatewayToken(TOKEN);
     expect(readGatewayToken(process.env, credentialSecurity())).toBe(TOKEN);
@@ -302,6 +325,7 @@ describe("OpenHands gateway contract", () => {
     };
     for (const config of [
       { ...validConfig, authToken: "forbidden" },
+      { ...validConfig, paperclipRuntimeSkills: [] },
       { ...validConfig, url: "https://gateway.example" },
       { ...validConfig, url: "ws://gateway.example" },
       { ...validConfig, url: "wss://gateway.example/paperclip-worker/v1#fragment" },
