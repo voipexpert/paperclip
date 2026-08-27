@@ -21,6 +21,11 @@ export async function testEnvironment(context: AdapterEnvironmentTestContext): P
         clearTimeout(timer);
         socket.removeListener("message", onMessage);
         socket.removeListener("error", onError);
+        // Keep one bounded error sink until the transport confirms close: ws can
+        // emit an error asynchronously when a CONNECTING socket is terminated.
+        const swallowLateError = () => {};
+        socket.once("error", swallowLateError);
+        socket.once("close", () => socket.removeListener("error", swallowLateError));
         if (socket.readyState !== WebSocket.CLOSED) { try { socket.terminate(); } catch { socket.close(); } }
         if (error) reject(error); else resolve();
       };

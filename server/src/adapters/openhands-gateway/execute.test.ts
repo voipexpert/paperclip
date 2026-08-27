@@ -284,6 +284,20 @@ describe("OpenHands gateway contract", () => {
     finally { await testGateway.close(); }
   });
 
+  it("rejects a contradictory rejected acknowledgement after acceptance", async () => {
+    await setGatewayToken();
+    const testGateway = await gateway((socket) => {
+      socket.send(JSON.stringify({ type: "hello", version: 1 }));
+      socket.on("message", (raw) => {
+        const dispatch = JSON.parse(String(raw));
+        socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: true, duplicate: false, state: "accepted" }));
+        socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: false, reason: "busy" }));
+      });
+    });
+    try { await expect(execute(context(testGateway.port))).resolves.toMatchObject({ errorCode: "OPENHANDS_PROTOCOL", clearSession: false }); }
+    finally { await testGateway.close(); }
+  });
+
   it("rejects wrong-version correlated frames and evidence keys outside the terminal allowlist", async () => {
     await setGatewayToken();
     for (const invalidCase of ["wrong-version", "leaky-evidence"] as const) {

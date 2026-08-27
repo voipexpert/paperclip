@@ -7,7 +7,7 @@ const MAX_PAYLOAD = 64 * 1024;
 const CANCEL_ACK_WAIT_MS = 5_000;
 const MAX_FRAME_STRING_BYTES = 128;
 const MAX_RESULT_STRING_BYTES = 4_096;
-const MAX_RESULT_BYTES = 16 * 1024;
+const MAX_RESULT_BYTES = 32 * 1024;
 const MAX_RESULT_KEYS = 32;
 const MAX_RESULT_ARRAY_ITEMS = 32;
 const MAX_RESULT_DEPTH = 4;
@@ -47,7 +47,18 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
 
 function boundedFrameString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= MAX_FRAME_STRING_BYTES
-    && value.normalize("NFC") === value && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+    && value.normalize("NFC") === value && !/[\u0000-\u001f\u007f-\u009f]/.test(value) && !hasLoneSurrogate(value);
+}
+
+function hasLoneSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      if (index + 1 >= value.length || value.charCodeAt(index + 1) < 0xdc00 || value.charCodeAt(index + 1) > 0xdfff) return true;
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) return true;
+  }
+  return false;
 }
 
 function isBoundedResultValue(value: unknown, depth = 0): boolean {
@@ -64,7 +75,13 @@ function isBoundedResultValue(value: unknown, depth = 0): boolean {
 function boundedText(value: unknown, byteLimit: number, characterLimit?: number): value is string {
   return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= byteLimit
     && (characterLimit === undefined || Array.from(value).length <= characterLimit)
-    && value.normalize("NFC") === value && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+    && value.normalize("NFC") === value && !/[\u0000-\u001f\u007f-\u009f]/.test(value) && !hasLoneSurrogate(value);
+}
+
+function evidenceText(value: unknown, byteLimit: number, characterLimit?: number): value is string {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= byteLimit
+    && (characterLimit === undefined || Array.from(value).length <= characterLimit)
+    && !/[\u0000-\u001f\u007f-\u009f]/.test(value) && !hasLoneSurrogate(value);
 }
 
 function isUtcTimestamp(value: unknown): boolean {
@@ -78,7 +95,7 @@ function isCompletedEvidence(value: unknown, dispatch: { repository: string; bas
   if (!evidence || (!noChange && !hasExactKeys(evidence, ["version", "repository", "base_ref", "branch", "commit", "tests", "draft_pr", "summary"]))
     || evidence.version !== 1 || evidence.repository !== dispatch.repository || evidence.base_ref !== dispatch.baseRef
     || !/^[0-9a-f]{40}$/.test(String(evidence.commit))
-    || !boundedText(evidence.summary, 2_000)) return false;
+    || !evidenceText(evidence.summary, 2_000)) return false;
   if (noChange) {
     if (evidence.outcome !== "no_change") return false;
   } else {
@@ -91,7 +108,7 @@ function isCompletedEvidence(value: unknown, dispatch: { repository: string; bas
   if (!Array.isArray(evidence.tests) || evidence.tests.length > MAX_RESULT_ARRAY_ITEMS) return false;
   if (!evidence.tests.every((test) => {
     const item = frame(test);
-    return !!item && hasExactKeys(item, ["name", "status"]) && boundedText(item.name, 200, 200)
+    return !!item && hasExactKeys(item, ["name", "status"]) && evidenceText(item.name, Number.MAX_SAFE_INTEGER, 200)
       && (item.status === "passed" || item.status === "failed" || item.status === "unknown");
   })) return false;
   try { return isBoundedResultValue(evidence) && Buffer.byteLength(JSON.stringify(evidence), "utf8") <= MAX_RESULT_BYTES; } catch { return false; }
@@ -136,6 +153,13 @@ function isRunResult(value: Record<string, unknown>, dispatch: { repository: str
 
 function matches(frameValue: Record<string, unknown>, dispatch: { runId: string; taskId: string; agentId: string }): boolean {
   return frameValue.version === 1 && frameValue.runId === dispatch.runId && frameValue.taskId === dispatch.taskId && frameValue.agentId === dispatch.agentId;
+}
+
+function canonicalFrame(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalFrame).join(",")}]`;
+  const object = frame(value);
+  if (!object) return JSON.stringify(value);
+  return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalFrame(object[key])}`).join(",")}}`;
 }
 
 export async function execute(context: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -207,9 +231,12 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
       if (incoming.type === "dispatch_ack") {
         if (!isDispatchAck(incoming)) { finish(result("OPENHANDS_PROTOCOL")); return; }
         if (!matches(incoming, dispatch)) return;
+        const signature = canonicalFrame(incoming);
+        if (acknowledged) {
+          if (signature !== acknowledgement) finish({ ...result("OPENHANDS_PROTOCOL"), clearSession: false, resultJson: { state: "indeterminate", reason: "ack_contradiction" } });
+          return;
+        }
         if (incoming.accepted === false) { await context.onLog("stderr", "OpenHands gateway dispatch rejected.\n"); finish(result(incoming.reason === "busy" ? "OPENHANDS_BUSY" : "OPENHANDS_REJECTED")); return; }
-        const signature = JSON.stringify(incoming);
-        if (acknowledged) { if (signature !== acknowledgement) finish(result("OPENHANDS_PROTOCOL")); return; }
         acknowledged = true;
         acknowledgement = signature;
         await context.onLog("stdout", "OpenHands gateway dispatch accepted.\n");
