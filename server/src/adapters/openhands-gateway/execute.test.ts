@@ -145,6 +145,19 @@ describe("OpenHands gateway contract", () => {
     }
   });
 
+  it("rejects malformed or BOM-framed UTF-8 credentials without normalizing valid decomposed text", async () => {
+    await setGatewayToken("decomposed-e\u0301-token");
+    expect(readGatewayToken(process.env)).toBe("decomposed-e\u0301-token");
+    const tokenDirectory = tokenDirectories.at(-1)!;
+    for (const [name, bytes] of [["bom", Buffer.from([0xef, 0xbb, 0xbf, 0x74])], ["malformed", Buffer.from([0xc3, 0x28])]] as const) {
+      const tokenFile = join(tokenDirectory, name);
+      await writeFile(tokenFile, bytes, { mode: 0o600 });
+      await chmod(tokenFile, 0o600);
+      process.env.OPENHANDS_GATEWAY_TOKEN_FILE = tokenFile;
+      expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
+    }
+  });
+
   it("accepts the existing redacted heartbeat issue fields alongside the OpenHands contract fields", () => {
     const issue = parsePaperclipIssue({
       paperclipIssue: {
