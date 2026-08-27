@@ -80,6 +80,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     skills: PaperclipSkillEntry[];
     mcpServers: AdapterRuntimeMcpServer[];
     config: Record<string, unknown>;
+    context: Record<string, unknown>;
     serializedRuntimeInput: string;
   }> = [];
   const cleanupDirs = new Set<string>();
@@ -109,6 +110,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
           skills: (ctx.config.paperclipRuntimeSkills ?? []) as PaperclipSkillEntry[],
           mcpServers: ctx.runtimeMcp?.getServers() ?? [],
           config: ctx.config,
+          context: ctx.context,
           serializedRuntimeInput,
         });
         return {
@@ -167,6 +169,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     const agentId = randomUUID();
     let capturedConfig: Record<string, unknown> | null = null;
     let capturedRuntimeSpecConfig: Record<string, unknown> | null = null;
+    let capturedContext: Record<string, unknown> | null = null;
     registerServerAdapter({
       type: "openhands_gateway",
       getRuntimeCommandSpec: (config) => {
@@ -175,6 +178,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       },
       execute: async (ctx) => {
         capturedConfig = ctx.config;
+        capturedContext = ctx.context;
         return { exitCode: 0, signal: null, timedOut: false, label: "Captured OpenHands config" };
       },
       testEnvironment: async () => ({
@@ -215,10 +219,17 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
       expect(run).not.toBeNull();
       expect((await waitForRunToFinish(heartbeat, run!.id))?.status).toBe("succeeded");
-      expect(capturedConfig).toMatchObject({ operatorUnknown: true });
-      expect(capturedConfig).not.toHaveProperty("paperclipRuntimeSkills");
-      expect(capturedRuntimeSpecConfig).toMatchObject({ operatorUnknown: true });
-      expect(capturedRuntimeSpecConfig).not.toHaveProperty("paperclipRuntimeSkills");
+      const expectedConfig = {
+        url: "wss://gateway.example/paperclip-worker/v1",
+        timeoutSec: 60,
+        projectTargets: {
+          project: { repository: "owner/repo", baseRef: "main", profile: "openhands" },
+        },
+        operatorUnknown: true,
+      };
+      expect(capturedConfig).toEqual(expectedConfig);
+      expect(capturedRuntimeSpecConfig).toEqual(expectedConfig);
+      expect(capturedContext).not.toHaveProperty("paperclipScratch");
     } finally {
       unregisterServerAdapter("openhands_gateway");
     }
@@ -339,6 +350,9 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       currentVersionId: versionTwo.id,
       sourceStatus: "available",
     });
+    const firstCapturedRun = capturedRuns.find((run) => run.agentId === firstAgentId);
+    expect(firstCapturedRun?.config.env).toBeTypeOf("object");
+    expect(firstCapturedRun?.context.paperclipScratch).toMatchObject({ type: "heartbeat_run" });
     await expect(fs.readFile(path.join(firstSkill!.source, "SKILL.md"), "utf8"))
       .resolves.toContain("Version one.");
     await expect(fs.readFile(path.join(secondSkill!.source, "SKILL.md"), "utf8"))

@@ -15418,7 +15418,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const workspaceRealization = realizationResult.workspaceRealization;
     const executionTarget = realizationResult.executionTarget;
     const remoteExecution = realizationResult.remoteExecution;
-    if (!executionTarget || executionTarget.kind === "local") {
+    if (
+      agent.adapterType !== "openhands_gateway" &&
+      (!executionTarget || executionTarget.kind === "local")
+    ) {
       try {
         runScratch = await prepareHeartbeatRunScratch({
           companyId: agent.companyId,

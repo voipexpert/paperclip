@@ -261,6 +261,16 @@ describe("OpenHands gateway contract", () => {
     await expect(execute(unknownContext)).resolves.toMatchObject({ errorCode: "OPENHANDS_CONFIG" });
   });
 
+  it("rejects an operator env key when execute is called directly", async () => {
+    await setGatewayToken();
+    const base = context(1);
+    const envContext = {
+      ...base,
+      config: { ...base.config, env: {} },
+    };
+    await expect(execute(envContext)).resolves.toMatchObject({ errorCode: "OPENHANDS_CONFIG" });
+  });
+
   it("preserves exact gateway credential bytes and rejects whitespace framing", async () => {
     await setGatewayToken(TOKEN);
     expect(readGatewayToken(process.env, credentialSecurity())).toBe(TOKEN);
