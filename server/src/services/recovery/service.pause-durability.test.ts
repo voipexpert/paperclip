@@ -32,6 +32,20 @@ describe("pause durability: continuation retry classification", () => {
     expect(c.maxAttempts).toBeGreaterThan(0);
   });
 
+  it("never schedules a continuation after a dispatched OpenHands outcome", () => {
+    for (const errorCode of [
+      "OPENHANDS_INDETERMINATE",
+      "OPENHANDS_PROTOCOL",
+      "OPENHANDS_REJECTED",
+      "OPENHANDS_FAILED",
+      "OPENHANDS_CANCELLED",
+      "OPENHANDS_TIMEOUT",
+    ]) {
+      const classification = classifyContinuationFailure(run(errorCode));
+      expect(classification).toMatchObject({ kind: "non_retryable", maxAttempts: 0, errorCode });
+    }
+  });
+
   it("generic cancelled (non-pause cancellation) is NOT non-retryable", () => {
     // non-pause cancellations (the internal invokability cancel and budget pause) keep errorCode "cancelled" -> default branch
     expect(classifyContinuationFailure(run("cancelled")).kind).toBe("default");

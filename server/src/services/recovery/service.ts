@@ -366,6 +366,15 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 ]);
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
+  // The OpenHands dispatch is a mutation. Once it has been sent, retrying can
+  // create a second Canvas conversation, so every adapter terminal code that
+  // follows that boundary remains visible but is never continuation-retried.
+  "OPENHANDS_INDETERMINATE",
+  "OPENHANDS_PROTOCOL",
+  "OPENHANDS_REJECTED",
+  "OPENHANDS_FAILED",
+  "OPENHANDS_CANCELLED",
+  "OPENHANDS_TIMEOUT",
   "agent_not_invokable",
   "agent_not_found",
   "budget_blocked",

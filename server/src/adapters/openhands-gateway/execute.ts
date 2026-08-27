@@ -10,6 +10,9 @@ const MAX_RESULT_BYTES = 16 * 1024;
 const MAX_RESULT_KEYS = 32;
 const MAX_RESULT_ARRAY_ITEMS = 32;
 const MAX_RESULT_DEPTH = 4;
+const NONTERMINAL_STATES = new Set(["accepted", "preparing", "running", "testing", "draft_pr_created"]);
+const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "timed_out", "indeterminate"]);
+const FAILURE_CODES = new Set(["validation", "busy", "canvas_unavailable", "model_provider_failure", "timeout", "broker_rejection", "policy_rejection", "indeterminate"]);
 const fixedMessages: Record<string, string> = {
   OPENHANDS_CONFIG: "OpenHands gateway configuration is invalid.",
   OPENHANDS_TOKEN: "OpenHands gateway credential is unavailable.",
@@ -40,7 +43,8 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
 }
 
 function boundedFrameString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= MAX_FRAME_STRING_BYTES;
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= MAX_FRAME_STRING_BYTES
+    && value.normalize("NFC") === value && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
 }
 
 function isBoundedResultValue(value: unknown, depth = 0): boolean {
@@ -54,10 +58,38 @@ function isBoundedResultValue(value: unknown, depth = 0): boolean {
   return Object.entries(object).every(([key, item]) => boundedFrameString(key) && isBoundedResultValue(item, depth + 1));
 }
 
-function isBoundedResult(value: unknown): value is Record<string, unknown> {
+function boundedText(value: unknown, byteLimit: number, characterLimit?: number): value is string {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= byteLimit
+    && (characterLimit === undefined || Array.from(value).length <= characterLimit)
+    && value.normalize("NFC") === value && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+}
+
+function isUtcTimestamp(value: unknown): boolean {
+  if (!boundedText(value, 64) || !value.endsWith("Z")) return false;
+  return Number.isFinite(Date.parse(value));
+}
+
+function isCompletedEvidence(value: unknown, dispatch: { repository: string; baseRef: string }): value is Record<string, unknown> {
   const evidence = frame(value);
-  if (!evidence || Object.keys(evidence).length === 0 || !isBoundedResultValue(evidence)) return false;
-  try { return Buffer.byteLength(JSON.stringify(evidence), "utf8") <= MAX_RESULT_BYTES; } catch { return false; }
+  if (!evidence || !hasExactKeys(evidence, ["version", "repository", "base_ref", "branch", "commit", "tests", "draft_pr", "summary"])
+    || evidence.version !== 1 || evidence.repository !== dispatch.repository || evidence.base_ref !== dispatch.baseRef
+    || !/^openhands\/pc-[0-9a-f]{20}$/.test(String(evidence.branch)) || !/^[0-9a-f]{40}$/.test(String(evidence.commit))
+    || !boundedText(evidence.summary, 2_000)) return false;
+  if (!Array.isArray(evidence.tests) || evidence.tests.length > MAX_RESULT_ARRAY_ITEMS) return false;
+  if (!evidence.tests.every((test) => {
+    const item = frame(test);
+    return !!item && hasExactKeys(item, ["name", "status"]) && boundedText(item.name, 200, 200)
+      && (item.status === "passed" || item.status === "failed" || item.status === "unknown");
+  })) return false;
+  const draft = frame(evidence.draft_pr);
+  if (!draft || !hasExactKeys(draft, ["number", "url"]) || !Number.isInteger(draft.number) || Number(draft.number) < 1
+    || draft.url !== `https://github.com/${dispatch.repository}/pull/${draft.number}`) return false;
+  try { return isBoundedResultValue(evidence) && Buffer.byteLength(JSON.stringify(evidence), "utf8") <= MAX_RESULT_BYTES; } catch { return false; }
+}
+
+function isFailureEvidence(value: unknown): value is Record<string, unknown> {
+  const evidence = frame(value);
+  return !!evidence && hasExactKeys(evidence, ["code"]) && typeof evidence.code === "string" && FAILURE_CODES.has(evidence.code);
 }
 
 function isHello(value: Record<string, unknown>): boolean {
@@ -65,22 +97,31 @@ function isHello(value: Record<string, unknown>): boolean {
 }
 
 function isDispatchAck(value: Record<string, unknown>): boolean {
-  return hasExactKeys(value, ["type", "version", "runId", "taskId", "agentId", "accepted"])
-    && value.type === "dispatch_ack" && value.version === 1 && boundedFrameString(value.runId)
-    && boundedFrameString(value.taskId) && boundedFrameString(value.agentId) && typeof value.accepted === "boolean";
+  const shared = value.type === "dispatch_ack" && value.version === 1 && boundedFrameString(value.runId)
+    && boundedFrameString(value.taskId) && boundedFrameString(value.agentId);
+  if (!shared) return false;
+  if (value.accepted === true) {
+    return hasExactKeys(value, ["type", "version", "runId", "taskId", "agentId", "accepted", "duplicate", "state"])
+      && typeof value.duplicate === "boolean" && typeof value.state === "string"
+      && (NONTERMINAL_STATES.has(value.state) || TERMINAL_STATES.has(value.state));
+  }
+  return value.accepted === false && hasExactKeys(value, ["type", "version", "runId", "taskId", "agentId", "accepted", "reason"])
+    && (value.reason === "busy" || value.reason === "validation");
 }
 
 function isRunEvent(value: Record<string, unknown>): boolean {
-  return hasExactKeys(value, ["type", "version", "runId", "taskId", "agentId", "event"])
+  return hasExactKeys(value, ["type", "version", "runId", "taskId", "agentId", "state", "timestamp"])
     && value.type === "run_event" && value.version === 1 && boundedFrameString(value.runId)
-    && boundedFrameString(value.taskId) && boundedFrameString(value.agentId) && boundedFrameString(value.event);
+    && boundedFrameString(value.taskId) && boundedFrameString(value.agentId) && typeof value.state === "string"
+    && NONTERMINAL_STATES.has(value.state) && isUtcTimestamp(value.timestamp);
 }
 
-function isRunResult(value: Record<string, unknown>): boolean {
+function isRunResult(value: Record<string, unknown>, dispatch: { repository: string; baseRef: string }): boolean {
   return hasExactKeys(value, ["type", "version", "runId", "taskId", "agentId", "status", "result"])
     && value.type === "run_result" && value.version === 1 && boundedFrameString(value.runId)
     && boundedFrameString(value.taskId) && boundedFrameString(value.agentId)
-    && (value.status === "completed" || value.status === "failed" || value.status === "cancelled") && isBoundedResult(value.result);
+    && typeof value.status === "string" && TERMINAL_STATES.has(value.status)
+    && (value.status === "completed" ? isCompletedEvidence(value.result, dispatch) : isFailureEvidence(value.result));
 }
 
 function matches(frameValue: Record<string, unknown>, dispatch: { runId: string; taskId: string; agentId: string }): boolean {
@@ -113,13 +154,13 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
       settled = true;
       clearTimeout(deadlineTimer);
       if (cancelWaitTimer) clearTimeout(cancelWaitTimer);
-      socket.close();
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) socket.terminate();
       resolve(value);
     };
-    const indeterminate = () => finish({
+    const indeterminate = (reason = "post_dispatch_disconnect") => finish({
       ...result("OPENHANDS_INDETERMINATE"),
       clearSession: false,
-      resultJson: { state: "indeterminate", reason: "post_dispatch_disconnect" },
+      resultJson: { state: "indeterminate", reason },
     });
     const deadlineTimer = setTimeout(() => {
       if (settled) return;
@@ -127,7 +168,7 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
       if (socket.readyState === WebSocket.OPEN) {
         try { socket.send(JSON.stringify({ type: "cancel", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId })); } catch { /* fixed timeout result below */ }
       }
-      cancelWaitTimer = setTimeout(() => finish(result("OPENHANDS_TIMEOUT", true)), CANCEL_ACK_WAIT_MS);
+      cancelWaitTimer = setTimeout(() => indeterminate("cancel_unacknowledged"), CANCEL_ACK_WAIT_MS);
     }, config.timeoutMs);
 
     socket.on("error", () => {
@@ -151,31 +192,35 @@ export async function execute(context: AdapterExecutionContext): Promise<Adapter
         } catch { finish(result("OPENHANDS_UNREACHABLE")); }
         return;
       }
-      if (!matches(incoming, dispatch)) return;
       if (incoming.type === "dispatch_ack") {
         if (!isDispatchAck(incoming)) { finish(result("OPENHANDS_PROTOCOL")); return; }
+        if (!matches(incoming, dispatch)) return;
         if (incoming.accepted === false) { await context.onLog("stderr", "OpenHands gateway dispatch rejected.\n"); finish(result("OPENHANDS_REJECTED")); return; }
-        if (!acknowledged) { acknowledged = true; await context.onLog("stdout", "OpenHands gateway dispatch accepted.\n"); }
+        if (acknowledged) { finish(result("OPENHANDS_PROTOCOL")); return; }
+        acknowledged = true;
+        await context.onLog("stdout", "OpenHands gateway dispatch accepted.\n");
         return;
       }
       if (incoming.type === "run_event") {
         if (!isRunEvent(incoming)) { finish(result("OPENHANDS_PROTOCOL")); return; }
+        if (!matches(incoming, dispatch)) return;
         if (!acknowledged) finish(result("OPENHANDS_PROTOCOL"));
         return;
       }
-      if (!isRunResult(incoming)) {
+      if (incoming.type !== "run_result" || !isRunResult(incoming, dispatch)) {
         finish(result("OPENHANDS_PROTOCOL"));
         return;
       }
+      if (!matches(incoming, dispatch)) return;
       if (!acknowledged) { finish(result("OPENHANDS_PROTOCOL")); return; }
-      if (cancellationStarted) { finish(result("OPENHANDS_TIMEOUT", true)); return; }
       if (incoming.status === "completed") {
         await context.onLog("stdout", "OpenHands gateway completed.\n");
         finish({ exitCode: 0, signal: null, timedOut: false, resultJson: frame(incoming.result)! });
       } else {
-        const code = incoming.status === "failed" ? "OPENHANDS_FAILED" : "OPENHANDS_CANCELLED";
+        if (incoming.status === "indeterminate") { indeterminate("gateway_indeterminate"); return; }
+        const code = incoming.status === "failed" ? "OPENHANDS_FAILED" : incoming.status === "cancelled" ? "OPENHANDS_CANCELLED" : "OPENHANDS_TIMEOUT";
         await context.onLog("stderr", `OpenHands gateway ${incoming.status}.\n`);
-        finish(result(code));
+        finish({ ...result(code, incoming.status === "timed_out"), resultJson: { state: incoming.status, reason: (incoming.result as { code: string }).code } });
       }
     });
   });

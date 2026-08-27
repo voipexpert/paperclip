@@ -16393,7 +16393,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         normalizeResponsibleUserDenialCode(latestRun?.errorCode);
       const runErrorCode =
         outcome === "timed_out"
-          ? "timeout"
+          ? (adapterResult.errorCode ?? "timeout")
           : outcome === "cancelled"
             ? (latestRun?.errorCode ?? "cancelled")
             : outcome === "failed"

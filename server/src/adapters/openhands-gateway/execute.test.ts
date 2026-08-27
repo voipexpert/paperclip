@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -68,6 +68,19 @@ function context(port: number, overrides: Record<string, unknown> = {}) {
   };
 }
 
+function completedEvidence() {
+  return {
+    version: 1,
+    repository: "voipexpert/openhands-worker-acceptance",
+    base_ref: "main",
+    branch: "openhands/pc-0123456789abcdef0123",
+    commit: "a".repeat(40),
+    tests: [{ name: "pnpm test", status: "passed" }],
+    draft_pr: { number: 1, url: "https://github.com/voipexpert/openhands-worker-acceptance/pull/1" },
+    summary: "Bounded canary completed.",
+  };
+}
+
 async function gateway(handler: (socket: import("ws").WebSocket, request: import("node:http").IncomingMessage) => void) {
   const server = createServer();
   const wss = new WebSocketServer({ server });
@@ -127,6 +140,17 @@ describe("OpenHands gateway contract", () => {
   it("rejects unsafe tokens and all invalid config or issue input", async () => {
     await setGatewayToken("test-token", 0o644);
     expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
+    const tokenDirectory = tokenDirectories.at(-1)!;
+    const emptyToken = join(tokenDirectory, "empty-token");
+    const oversizedToken = join(tokenDirectory, "oversized-token");
+    const tokenLink = join(tokenDirectory, "token-link");
+    await writeFile(emptyToken, "", { mode: 0o600 });
+    await writeFile(oversizedToken, "x".repeat(4_097), { mode: 0o600 });
+    await symlink(join(tokenDirectory, "token"), tokenLink);
+    for (const tokenFile of [emptyToken, oversizedToken, tokenLink]) {
+      process.env.OPENHANDS_GATEWAY_TOKEN_FILE = tokenFile;
+      expect(readGatewayToken(process.env)).toBeInstanceOf(Error);
+    }
 
     const validConfig = {
       url: "wss://gateway.example/paperclip-worker/v1", timeoutSec: 60,
@@ -190,12 +214,11 @@ describe("OpenHands gateway contract", () => {
         const frame = JSON.parse(String(raw)) as Record<string, unknown>;
         received.push(frame);
         if (frame.type !== "dispatch") return;
-        socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, accepted: true }));
-        socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, accepted: true }));
-        socket.send(JSON.stringify({ type: "run_result", version: 1, runId: "other", taskId: frame.taskId, agentId: frame.agentId, status: "completed", result: { forged: true } }));
-        socket.send(JSON.stringify({ type: "run_event", version: 1, runId: frame.runId, taskId: "other", agentId: frame.agentId, event: "progress" }));
-        socket.send(JSON.stringify({ type: "run_result", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: "other", status: "completed", result: { forged: true } }));
-        socket.send(JSON.stringify({ type: "run_result", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, status: "completed", result: { outcome: "canary complete" } }));
+        socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, accepted: true, duplicate: false, state: "accepted" }));
+        socket.send(JSON.stringify({ type: "run_result", version: 1, runId: "other", taskId: frame.taskId, agentId: frame.agentId, status: "completed", result: completedEvidence() }));
+        socket.send(JSON.stringify({ type: "run_event", version: 1, runId: frame.runId, taskId: "other", agentId: frame.agentId, state: "running", timestamp: "2026-08-27T12:00:00.000Z" }));
+        socket.send(JSON.stringify({ type: "run_result", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: "other", status: "completed", result: completedEvidence() }));
+        socket.send(JSON.stringify({ type: "run_result", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, status: "completed", result: completedEvidence() }));
       });
     });
     try {
@@ -205,15 +228,60 @@ describe("OpenHands gateway contract", () => {
         repository: "voipexpert/openhands-worker-acceptance", baseRef: "main", profile: "openhands",
         title: "Canary", objective: "Make the bounded canary change.",
       }]);
-      expect(result).toMatchObject({ exitCode: 0, timedOut: false, resultJson: { outcome: "canary complete" } });
+      expect(result).toMatchObject({ exitCode: 0, timedOut: false, resultJson: completedEvidence() });
       expect(logs).toEqual([["stdout", "OpenHands gateway dispatch accepted.\n"], ["stdout", "OpenHands gateway completed.\n"]]);
     } finally { await testGateway.close(); }
+  });
+
+  it("accepts the documented exact lifecycle frames and terminal completed evidence", async () => {
+    await setGatewayToken();
+    const testGateway = await gateway((socket) => {
+      socket.send(JSON.stringify({ type: "hello", version: 1 }));
+      socket.on("message", (raw) => {
+        const dispatch = JSON.parse(String(raw));
+        socket.send(JSON.stringify({
+          type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId,
+          agentId: dispatch.agentId, accepted: true, duplicate: false, state: "accepted",
+        }));
+        socket.send(JSON.stringify({
+          type: "run_event", version: 1, runId: dispatch.runId, taskId: dispatch.taskId,
+          agentId: dispatch.agentId, state: "running", timestamp: "2026-08-27T12:00:00.000Z",
+        }));
+        socket.send(JSON.stringify({
+          type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId,
+          agentId: dispatch.agentId, status: "completed", result: completedEvidence(),
+        }));
+      });
+    });
+    try {
+      await expect(execute(context(testGateway.port))).resolves.toMatchObject({
+        exitCode: 0,
+        resultJson: completedEvidence(),
+      });
+    } finally { await testGateway.close(); }
+  });
+
+  it("rejects wrong-version correlated frames and evidence keys outside the terminal allowlist", async () => {
+    await setGatewayToken();
+    for (const invalidCase of ["wrong-version", "leaky-evidence"] as const) {
+      const testGateway = await gateway((socket) => {
+        socket.send(JSON.stringify({ type: "hello", version: 1 }));
+        socket.on("message", (raw) => {
+          const dispatch = JSON.parse(String(raw));
+          socket.send(JSON.stringify({ type: "dispatch_ack", version: invalidCase === "wrong-version" ? 2 : 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: true, duplicate: false, state: "accepted" }));
+          if (invalidCase === "leaky-evidence") socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, status: "indeterminate", result: { code: "indeterminate", leaked: "forbidden" } }));
+        });
+      });
+      try {
+        await expect(execute(context(testGateway.port))).resolves.toMatchObject({ errorCode: "OPENHANDS_PROTOCOL" });
+      } finally { await testGateway.close(); }
+    }
   });
 
   it("returns bounded fixed errors for rejected, malformed, and non-completed terminal results without leaking gateway data", async () => {
     await setGatewayToken();
     for (const response of [
-      { type: "dispatch_ack", accepted: false, error: "do not leak this exception body" },
+      { type: "dispatch_ack", accepted: false, reason: "busy" },
       { type: "run_result", status: "completed", result: "not evidence" },
       { type: "run_result", status: "failed", result: { details: "do not leak this exception body" } },
       { type: "run_result", status: "cancelled", result: {} },
@@ -245,7 +313,7 @@ describe("OpenHands gateway contract", () => {
       socket.send(JSON.stringify({ type: "hello", version: 1 }));
       socket.on("message", (raw) => {
         const dispatch = JSON.parse(String(raw));
-        socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, status: "completed", result: {} }));
+        socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, status: "completed", result: completedEvidence() }));
       });
     });
     try {
@@ -259,7 +327,7 @@ describe("OpenHands gateway contract", () => {
       socket.send(JSON.stringify({ type: "hello", version: 1 }));
       socket.on("message", (raw) => {
         const dispatch = JSON.parse(String(raw));
-        socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: true }));
+        socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: true, duplicate: false, state: "accepted" }));
         socket.close();
       });
     });
@@ -311,8 +379,8 @@ describe("OpenHands gateway contract", () => {
     await setGatewayToken();
     const cases: Array<{ name: string; onConnect: (socket: import("ws").WebSocket, dispatch?: Record<string, unknown>) => void }> = [
       { name: "hello", onConnect: (socket) => socket.send(JSON.stringify({ type: "hello", version: 1, extra: true })) },
-      { name: "ack", onConnect: (socket, dispatch) => socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch?.runId, taskId: dispatch?.taskId, agentId: dispatch?.agentId, accepted: true, extra: true })) },
-      { name: "event", onConnect: (socket, dispatch) => socket.send(JSON.stringify({ type: "run_event", version: 1, runId: dispatch?.runId, taskId: dispatch?.taskId, agentId: dispatch?.agentId, event: "progress", extra: true })) },
+      { name: "ack", onConnect: (socket, dispatch) => socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch?.runId, taskId: dispatch?.taskId, agentId: dispatch?.agentId, accepted: true, duplicate: false, state: "accepted", extra: true })) },
+      { name: "event", onConnect: (socket, dispatch) => socket.send(JSON.stringify({ type: "run_event", version: 1, runId: dispatch?.runId, taskId: dispatch?.taskId, agentId: dispatch?.agentId, state: "running", timestamp: "2026-08-27T12:00:00.000Z", extra: true })) },
       { name: "result", onConnect: (socket, dispatch) => socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch?.runId, taskId: dispatch?.taskId, agentId: dispatch?.agentId, status: "completed", result: { summary: "x".repeat(4_097) } })) },
     ];
     for (const testCase of cases) {
@@ -321,9 +389,9 @@ describe("OpenHands gateway contract", () => {
         socket.send(JSON.stringify({ type: "hello", version: 1 }));
         socket.on("message", (raw) => {
           const dispatch = JSON.parse(String(raw));
-          if (testCase.name !== "ack") socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: true }));
+          if (testCase.name !== "ack") socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: true, duplicate: false, state: "accepted" }));
           testCase.onConnect(socket, dispatch);
-          if (testCase.name === "ack" || testCase.name === "event") socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, status: "completed", result: { summary: "valid" } }));
+          if (testCase.name === "ack" || testCase.name === "event") socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, status: "completed", result: completedEvidence() }));
         });
       });
       try {
@@ -332,7 +400,7 @@ describe("OpenHands gateway contract", () => {
     }
   });
 
-  it("sends one matching cancel at its absolute deadline and returns OPENHANDS_TIMEOUT after acknowledgement wait", async () => {
+  it("sends one matching cancel at its absolute deadline and preserves a gateway timed_out terminal", async () => {
     await setGatewayToken();
     const received: Record<string, unknown>[] = [];
     let dispatchSeen!: () => void;
@@ -344,9 +412,9 @@ describe("OpenHands gateway contract", () => {
         received.push(frame);
         if (frame.type === "dispatch") {
           dispatchSeen();
-          socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, accepted: true }));
+          socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, accepted: true, duplicate: false, state: "accepted" }));
         }
-        if (frame.type === "cancel") socket.send(JSON.stringify({ type: "run_result", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, status: "cancelled", result: { state: "cancelled" } }));
+        if (frame.type === "cancel") socket.send(JSON.stringify({ type: "run_result", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, status: "timed_out", result: { code: "timeout" } }));
       });
     });
     try {
@@ -360,7 +428,7 @@ describe("OpenHands gateway contract", () => {
     } finally { vi.useRealTimers(); await testGateway.close(); }
   });
 
-  it("keeps OPENHANDS_TIMEOUT when the socket errors during cancellation grace", async () => {
+  it("records an unacknowledged cancellation disconnect as indeterminate", async () => {
     await setGatewayToken();
     let dispatchSeen!: () => void;
     const dispatchReceived = new Promise<void>((resolve) => { dispatchSeen = resolve; });
@@ -370,7 +438,7 @@ describe("OpenHands gateway contract", () => {
         const frame = JSON.parse(String(raw)) as Record<string, unknown>;
         if (frame.type === "dispatch") {
           dispatchSeen();
-          socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, accepted: true }));
+          socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: frame.runId, taskId: frame.taskId, agentId: frame.agentId, accepted: true, duplicate: false, state: "accepted" }));
         }
         if (frame.type === "cancel") {
           const transport = socket as unknown as { _socket: { write: (data: Uint8Array) => boolean } };
@@ -383,7 +451,7 @@ describe("OpenHands gateway contract", () => {
       const resultPromise = execute(context(testGateway.port));
       await dispatchReceived;
       await vi.advanceTimersByTimeAsync(65_000);
-      await expect(resultPromise).resolves.toMatchObject({ errorCode: "OPENHANDS_TIMEOUT", timedOut: true });
+      await expect(resultPromise).resolves.toMatchObject({ errorCode: "OPENHANDS_INDETERMINATE", timedOut: false, clearSession: false, resultJson: { state: "indeterminate", reason: "cancel_unacknowledged" } });
     } finally { vi.useRealTimers(); await testGateway.close(); }
   });
 });
