@@ -73,7 +73,7 @@ If disposition fails or is ambiguous, the adapter returns the fixed `OPENHANDS_D
 
 - `context.authToken` is the sole authorization source; adapter configuration cannot supply or override it.
 - The built-in registry enables local-agent JWT minting for `openhands_gateway`.
-- `PAPERCLIP_API_URL` is the server-owned API location.
+- `PAPERCLIP_API_URL` is the server-owned API location. The disposition client requires HTTPS for every non-loopback host; cleartext HTTP is permitted only when the parsed hostname is `localhost`, IPv6 `::1`, or an IPv4 address in `127.0.0.0/8`.
 - The client rejects redirects, has an exact 10,000 ms deadline, and accepts at most 65,536 response bytes before fatal UTF-8 decoding and JSON validation.
 - Deadline timers are cleared after success and every failure.
 - Native-fetch behavior is covered for redirect responses and for responses whose headers arrive while the body stalls.

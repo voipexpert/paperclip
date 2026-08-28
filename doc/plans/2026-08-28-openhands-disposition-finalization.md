@@ -4,7 +4,7 @@
 
 **Goal:** Record a validated OpenHands completion as one authenticated, run-conditioned, atomic and idempotent Paperclip disposition before adapter success.
 
-**Architecture:** The adapter calls `POST /api/issues/{issueId}/openhands-disposition` with a strict bounded evidence tuple. Real local-JWT middleware supplies the actor. The issue service locks the issue row, validates live ownership/execution locks, and commits `done` plus one exact run-attributed receipt comment in a single transaction. The client confirms the matching issue/status under existing redirect, deadline, body-size, UTF-8, and fixed-error protections.
+**Architecture:** The adapter calls `POST /api/issues/{issueId}/openhands-disposition` with a strict bounded evidence tuple. Real local-JWT middleware supplies the actor. The issue service locks the issue row, validates live ownership/execution locks, and commits `done` plus one exact run-attributed receipt comment in a single transaction. The client confirms the matching issue/status under existing redirect, deadline, body-size, UTF-8, fixed-error, and HTTPS-or-loopback transport protections.
 
 **Tech Stack:** TypeScript, Express, Drizzle/PostgreSQL, Node 26 native fetch/Web Streams, Vitest, pnpm.
 
@@ -24,7 +24,7 @@
 **Files:**
 
 - Modify `docs/superpowers/specs/2026-08-28-openhands-disposition-finalization-design.md`
-- Modify `docs/superpowers/plans/2026-08-28-openhands-disposition-finalization.md`
+- Modify `doc/plans/2026-08-28-openhands-disposition-finalization.md`
 
 - [ ] Replace the generic PATCH design with the approved dedicated endpoint and transaction invariants.
 - [ ] Document the exact receipt, replay, stale-state, terminal-race, evidence, and token-isolation rules.

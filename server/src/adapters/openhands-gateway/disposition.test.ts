@@ -138,12 +138,26 @@ describe("finalizeOpenHandsDisposition", () => {
     ["API URL with a fragment", input({ apiUrl: "http://127.0.0.1:3100#forbidden" })],
     ["API URL with an empty fragment delimiter", input({ apiUrl: "http://127.0.0.1:3100#" })],
     ["API URL with an untrusted base path", input({ apiUrl: "http://127.0.0.1:3100/not-api" })],
+    ["cleartext API URL on an external hostname", input({ apiUrl: "http://paperclip.example:3100" })],
+    ["cleartext API URL on a non-loopback IPv4 address", input({ apiUrl: "http://192.0.2.1:3100" })],
   ])("rejects %s before sending a request", async (_name, unsafeInput) => {
     const calls: CapturedRequest[] = [];
 
     await expectDispositionFailure(() => finalizeOpenHandsDisposition(unsafeInput, requestThatCaptures(calls)));
 
     expect(calls).toHaveLength(0);
+  });
+
+  it.each([
+    "http://localhost:3100",
+    "http://127.0.0.2:3100",
+    "http://[::1]:3100",
+  ])("permits cleartext disposition only on parsed loopback host %s", async (apiUrl) => {
+    const calls: CapturedRequest[] = [];
+
+    await finalizeOpenHandsDisposition(input({ apiUrl }), requestThatCaptures(calls));
+
+    expect(calls).toHaveLength(1);
   });
 
   it.each([

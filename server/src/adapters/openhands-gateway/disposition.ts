@@ -53,11 +53,21 @@ function dispositionEvidence(evidence: Record<string, unknown>): OpenHandsDispos
   return parsed.data;
 }
 
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (normalized === "localhost" || normalized === "::1") return true;
+  const octets = normalized.split(".");
+  return octets.length === 4
+    && octets[0] === "127"
+    && octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255);
+}
+
 function issueEndpoint(apiUrl: string, issueId: string): string {
   const authority = /^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/i.exec(apiUrl)?.[1];
   if (apiUrl.includes("?") || apiUrl.includes("#") || authority?.includes("@")) throw failure();
   const base = new URL(apiUrl);
   if ((base.protocol !== "http:" && base.protocol !== "https:") || base.username || base.password || base.search || base.hash) throw failure();
+  if (base.protocol === "http:" && !isLoopbackHostname(base.hostname)) throw failure();
   if (base.pathname !== "/" && !base.pathname.endsWith("/api")) throw failure();
   const path = base.pathname === "/" ? "/api" : base.pathname;
   base.pathname = `${path}/issues/${encodeURIComponent(issueId)}/openhands-disposition`;
