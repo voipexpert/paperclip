@@ -2,6 +2,7 @@ import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclip
 import { createHash } from "node:crypto";
 import { WebSocket } from "ws";
 import { ContractError, buildDispatch, parseOpenHandsConfig, parsePaperclipIssue, readGatewayToken, type GatewayCredentialSecurityContext } from "./contract.js";
+import { finalizeOpenHandsDisposition } from "./disposition.js";
 
 const MAX_PAYLOAD = 64 * 1024;
 const CANCEL_ACK_WAIT_MS = 5_000;
@@ -30,6 +31,7 @@ const fixedMessages: Record<string, string> = {
   OPENHANDS_TIMEOUT: "OpenHands gateway timed out.",
   OPENHANDS_PRE_DISPATCH_TIMEOUT: "OpenHands gateway timed out before dispatch.",
   OPENHANDS_BUSY: "OpenHands gateway is busy.",
+  OPENHANDS_DISPOSITION: "OpenHands gateway issue disposition failed.",
 };
 
 function result(code: string, timedOut = false): AdapterExecutionResult {
@@ -182,6 +184,7 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
     let dispatchSent = false;
     let acknowledged = false;
     let acknowledgement: string | null = null;
+    let completionStarted = false;
     let cancellationStarted = false;
     let cancelWaitTimer: ReturnType<typeof setTimeout> | null = null;
     const finish = (value: AdapterExecutionResult) => {
@@ -208,11 +211,11 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
     }, config.timeoutMs);
 
     socket.on("error", () => {
-      if (cancellationStarted) return;
+      if (cancellationStarted || completionStarted) return;
       dispatchSent ? indeterminate() : finish(result("OPENHANDS_UNREACHABLE"));
     });
     socket.on("close", () => {
-      if (!settled && !cancellationStarted) dispatchSent ? indeterminate() : finish(result("OPENHANDS_DISCONNECTED"));
+      if (!settled && !cancellationStarted && !completionStarted) dispatchSent ? indeterminate() : finish(result("OPENHANDS_DISCONNECTED"));
     });
     socket.on("message", async (raw) => {
       let incoming: Record<string, unknown> | null;
@@ -255,9 +258,24 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
       if (!matches(incoming, dispatch)) return;
       if (!acknowledged) { finish(result("OPENHANDS_PROTOCOL")); return; }
       if (incoming.status === "completed") {
+        if (completionStarted) return;
+        completionStarted = true;
+        clearTimeout(deadlineTimer);
+        try {
+          await finalizeOpenHandsDisposition({
+            issueId: issue.id,
+            evidence: frame(incoming.result)!,
+            authToken: context.authToken,
+            apiUrl: process.env.PAPERCLIP_API_URL,
+          });
+        } catch {
+          finish(result("OPENHANDS_DISPOSITION"));
+          return;
+        }
         await context.onLog("stdout", "OpenHands gateway completed.\n");
         finish({ exitCode: 0, signal: null, timedOut: false, resultJson: frame(incoming.result)! });
       } else {
+        if (completionStarted) return;
         if (incoming.status === "indeterminate") { indeterminate("gateway_indeterminate"); return; }
         const code = incoming.status === "failed" ? "OPENHANDS_FAILED" : incoming.status === "cancelled" ? "OPENHANDS_CANCELLED" : "OPENHANDS_TIMEOUT";
         await context.onLog("stderr", `OpenHands gateway ${incoming.status}.\n`);
