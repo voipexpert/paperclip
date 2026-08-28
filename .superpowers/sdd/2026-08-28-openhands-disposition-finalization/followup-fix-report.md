@@ -222,3 +222,71 @@ Result: all exited 0 under Node 26. The final feature run was repeated after rem
 - No JWT, raw environment, response body, token, or private hook failure was logged or added to evidence.
 
 Updated concern: the review phrase "superseded request confirmation" cannot literally apply to the OpenHands receipt without weakening an intentional invariant. The receipt is agent/run-attributed, and the service only lets genuine human comments supersede confirmations; additionally, the atomic terminal update expires pending interactions before receipt insertion. This round tests the real behavior rather than changing those established semantics.
+
+## Final whole-branch fix wave
+
+Review found that the generic authenticated `PATCH /api/issues/{issueId}` completion path committed the terminal issue and comment, then directly awaited comment reference synchronization, external-object synchronization, and request-confirmation expiry before invoking the shared completion orchestrator. A rejection from any of those three post-commit phases returned 500 and permanently skipped issue/comment activity, terminal interaction expiry, sandbox cleanup, dependent/parent wakes, and watchdog reconciliation.
+
+### Root cause and design
+
+- `usesCompletedIssuePostCommitLifecycle` correctly suppressed the generic branch's legacy routine/run/activity effects so the shared orchestrator would own them exactly once.
+- The three generic comment phases still ran as unguarded awaits before delegation. Their thrown errors escaped the route after persistence but before `runCompletedIssuePostCommitLifecycle`.
+- Moving reference synchronization wholly into the later orchestrator would change the response's related-work summary timing. The minimal fix instead reuses one completion post-commit isolation helper for the three generic comment phases while they remain in place.
+- Isolation applies only to `in_progress -> done` with a comment. Other generic PATCH transitions retain their prior fail-fast behavior. The shared orchestrator's `synchronizeComment: false` and `expireCommentConfirmations: false` gates remain unchanged, so no legacy effect is duplicated.
+
+### RED
+
+The three real generic PATCH regressions were added before the production change:
+
+```bash
+PATH=/opt/homebrew/bin:$PATH pnpm exec vitest run \
+  server/src/__tests__/openhands-disposition-route.test.ts \
+  -t "keeps generic PATCH completion lifecycle running" \
+  --reporter=verbose
+```
+
+Observed result: **1 file failed; 3 tests failed, 16 skipped**. Reference sync, external-object sync, and confirmation expiry rejection cases all failed at the response contract with **500 received instead of 200**. This confirmed each direct await aborted before the shared orchestrator.
+
+### Minimal GREEN implementation
+
+- Extracted the shared `runCompletedIssuePostCommitHook` catch/log boundary from the orchestrator's local helper.
+- Added a completion-only `runCommentLifecyclePhase` selector to the generic PATCH route. It isolates each of the three post-commit comment phases independently for delegated completion and invokes the original effect directly for every other transition.
+- Kept confirmation expiry plus its expiry-activity logging within one isolated phase, returning an empty interaction list only after an isolated completion failure.
+- Added the explicit existing `svc.addComment` return type needed when TypeScript analyzed `comment` across the new callback boundary.
+- Each failure regression uses a real JWT route, persisted issue/comment/activity state, the real embedded database fixture, and deterministic detached-work drain. It proves every comment phase is attempted once and every later routine/run/activity/terminal-expiry/cleanup/wake/watchdog effect still occurs exactly once.
+
+Targeted GREEN for the same command: **1 file passed; 3 tests passed, 16 skipped**.
+
+### Full verification under Node 26
+
+```bash
+PATH=/opt/homebrew/bin:$PATH pnpm exec vitest run \
+  server/src/__tests__/openhands-disposition-route.test.ts --reporter=dot
+```
+
+Result: **1 file passed, 19 tests passed**.
+
+The six-file focused OpenHands command recorded earlier passed **6 files, 152 tests**. The shared lifecycle route command passed **4 files, 94 tests**. The recovery command passed **7 files, 98 tests**.
+
+The first typecheck/build after the behavior change correctly exposed four `implicit any` errors for the callback-captured `comment` variable. After adding the explicit service return type, fresh commands passed:
+
+```bash
+PATH=/opt/homebrew/bin:$PATH pnpm --filter @paperclipai/server typecheck
+PATH=/opt/homebrew/bin:$PATH pnpm --filter @paperclipai/server build
+git diff --check
+```
+
+Result: typecheck and build exited 0; the build wrote the local build stamp; diff check emitted no errors. The final status and staged-scope checks are recorded immediately before commit.
+
+The stale SDD ledger entry describing the old 100 ms rejecting-log race is now marked resolved/superseded by the deterministic terminal settlement coverage already documented in `final-fix-report.md`.
+
+### Final-wave self-review
+
+- A reference-sync failure cannot suppress external sync, confirmation expiry, or the shared orchestrator; the equivalent claims hold for failures in either later comment phase.
+- The response remains 200 with persisted `done` state and one completion comment because all three operations are post-commit lifecycle work.
+- Activity rows, routine/run touch, terminal interaction expiry, cleanup, two intended wakes, and watchdog reconciliation are asserted after deterministic drain in each failure case.
+- The existing no-failure parity test still proves the generic route invokes shared effects once and retains legacy-effect suppression.
+- Non-completion generic PATCH behavior, transaction/receipt semantics, replay behavior, attribution rules, and remote integrations were not changed.
+- No credential, raw environment, response body, or external system was accessed or recorded.
+
+Concerns: none for this final wave. The previously documented agent-receipt interaction-attribution limitation remains unchanged and outside this finding.

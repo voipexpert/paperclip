@@ -369,6 +369,54 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
     ]));
   });
 
+  it.each([
+    ["comment reference sync", "syncCommentReferences"],
+    ["comment external-object sync", "syncCommentExternalObjects"],
+    ["comment confirmation expiry", "expireRequestConfirmationsSupersededByComment"],
+  ] as const)("keeps generic PATCH completion lifecycle running when %s fails", async (_label, failingHook) => {
+    const fixture = await seedFixture(postgres.db, { lifecycle: true });
+    const lifecycle = lifecycleHarness();
+    const injectedFailure = vi.fn(async () => {
+      throw new Error(`injected ${failingHook} failure`);
+    });
+    const hooks = {
+      ...lifecycle.hooks,
+      [failingHook]: injectedFailure,
+    };
+
+    const response = await request(app(hooks))
+      .patch(`/api/issues/${fixture.issueId}`)
+      .set("Authorization", `Bearer ${fixture.token}`)
+      .send({ status: "done", comment: "Validated completion evidence." });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toMatchObject({ id: fixture.issueId, status: "done" });
+    await lifecycle.drain();
+
+    expect(hooks.syncCommentReferences).toHaveBeenCalledOnce();
+    expect(hooks.syncCommentExternalObjects).toHaveBeenCalledOnce();
+    expect(hooks.expireRequestConfirmationsSupersededByComment).toHaveBeenCalledOnce();
+    expect(hooks.syncRoutineRunStatusForIssue).toHaveBeenCalledOnce();
+    expect(hooks.reportRunActivity).toHaveBeenCalledOnce();
+    expect(hooks.expirePendingInteractionsForTerminalIssue).toHaveBeenCalledOnce();
+    expect(hooks.destroyReusableSandboxLeases).toHaveBeenCalledOnce();
+    expect(hooks.reconcileTaskWatchdogs).toHaveBeenCalledOnce();
+    expect(hooks.wakeup).toHaveBeenCalledTimes(2);
+    expect(hooks.scheduleDetachedLifecycle).toHaveBeenCalledTimes(2);
+
+    const [persistedIssue, comments, activities] = await Promise.all([
+      postgres.db.select().from(issues).where(eq(issues.id, fixture.issueId)).then((rows) => rows[0]),
+      postgres.db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issueId)),
+      postgres.db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, fixture.issueId),
+        inArray(activityLog.action, ["issue.updated", "issue.comment_added"]),
+      )),
+    ]);
+    expect(persistedIssue?.status).toBe("done");
+    expect(comments).toHaveLength(1);
+    expect(activities).toHaveLength(2);
+  });
+
   it("isolates a post-commit hook failure and never retries lifecycle mutation on receipt replay", async () => {
     const fixture = await seedFixture(postgres.db);
     const hookFailureDetail = "private routine hook failure";

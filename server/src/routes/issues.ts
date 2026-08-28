@@ -5716,6 +5716,19 @@ export function issueRoutes(
     }
   }
 
+  async function runCompletedIssuePostCommitHook<T>(
+    issueId: string,
+    hook: string,
+    effect: () => Promise<T>,
+  ): Promise<T | null> {
+    try {
+      return await effect();
+    } catch (err) {
+      logger.warn({ err, issueId, hook }, "issue completion post-commit hook failed");
+      return null;
+    }
+  }
+
   async function runCompletedIssuePostCommitLifecycle(input: {
     previousIssue: { status: string };
     issue: {
@@ -5735,14 +5748,8 @@ export function issueRoutes(
   }) {
     if (input.previousIssue.status !== "in_progress" || input.issue.status !== "done") return;
 
-    const runIsolated = async <T>(hook: string, effect: () => Promise<T>): Promise<T | null> => {
-      try {
-        return await effect();
-      } catch (err) {
-        logger.warn({ err, issueId: input.issue.id, hook }, "issue completion post-commit hook failed");
-        return null;
-      }
-    };
+    const runIsolated = <T>(hook: string, effect: () => Promise<T>) =>
+      runCompletedIssuePostCommitHook(input.issue.id, hook, effect);
 
     await runIsolated("routine_sync", () =>
       completionLifecycleHooks.syncRoutineRunStatusForIssue(input.issue.id));
@@ -10457,6 +10464,10 @@ export function issueRoutes(
       existing.status === "in_progress"
       && issue.status === "done"
       && Boolean(commentBody);
+    const runCommentLifecyclePhase = <T>(hook: string, effect: () => Promise<T>) =>
+      usesCompletedIssuePostCommitLifecycle
+        ? runCompletedIssuePostCommitHook(issue.id, hook, effect)
+        : effect();
     if (!usesCompletedIssuePostCommitLifecycle) {
       await completionLifecycleHooks.syncRoutineRunStatusForIssue(issue.id);
     }
@@ -10771,7 +10782,7 @@ export function issueRoutes(
       }
     }
 
-    let comment = null;
+    let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
     let commentAddedActivity: LogActivityInput | null = null;
     let lostReviewPathRef: string | null = null;
     if (commentBody) {
@@ -10786,8 +10797,10 @@ export function issueRoutes(
         authorizationReason: issueMutationAuthorizationReason,
         sourceTrust: await sourceTrustForActorWrite(issue, actor),
       });
-      await completionLifecycleHooks.syncCommentReferences(comment.id);
-      await completionLifecycleHooks.syncCommentExternalObjects(comment.id);
+      await runCommentLifecyclePhase("comment_reference_sync", () =>
+        completionLifecycleHooks.syncCommentReferences(comment.id));
+      await runCommentLifecyclePhase("comment_external_object_sync", () =>
+        completionLifecycleHooks.syncCommentExternalObjects(comment.id));
       const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
         commentReferenceSummaryBefore,
@@ -10840,20 +10853,23 @@ export function issueRoutes(
         await logActivity(db, commentAddedActivity);
       }
 
-      const expiredInteractions = await completionLifecycleHooks.expireRequestConfirmationsSupersededByComment(
-        issue,
-        comment,
-        {
-          agentId: actor.agentId,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-        },
-      );
-      await logExpiredRequestConfirmations({
-        issue,
-        interactions: expiredInteractions,
-        actor,
-        source: "issue.comment",
-      });
+      const expiredInteractions = await runCommentLifecyclePhase("comment_confirmation_expiry", async () => {
+        const interactions = await completionLifecycleHooks.expireRequestConfirmationsSupersededByComment(
+          issue,
+          comment,
+          {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        );
+        await logExpiredRequestConfirmations({
+          issue,
+          interactions,
+          actor,
+          source: "issue.comment",
+        });
+        return interactions;
+      }) ?? [];
       if (issue.status === "in_review" && expiredInteractions.length > 0) {
         const reviewAttention = await svc
           .listReviewAttention(issue.companyId, [issue])
