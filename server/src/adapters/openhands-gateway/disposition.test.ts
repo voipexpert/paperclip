@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { OpenHandsDispositionError, finalizeOpenHandsDisposition } from "./disposition.js";
 
 const noChangeEvidence = {
@@ -58,6 +58,10 @@ async function expectDispositionFailure(action: () => Promise<void>): Promise<Op
 }
 
 describe("finalizeOpenHandsDisposition", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("patches the normalized issue endpoint with a deterministic no-change disposition", async () => {
     const calls: CapturedRequest[] = [];
 
@@ -92,13 +96,27 @@ describe("finalizeOpenHandsDisposition", () => {
     ["malformed API URL", input({ apiUrl: "not a URL" })],
     ["non-HTTP API URL", input({ apiUrl: "ftp://127.0.0.1:3100" })],
     ["credentialed API URL", input({ apiUrl: "http://user:password@127.0.0.1:3100" })],
+    ["API URL with empty userinfo", input({ apiUrl: "http://@127.0.0.1:3100" })],
     ["API URL with a query", input({ apiUrl: "http://127.0.0.1:3100?token=forbidden" })],
+    ["API URL with an empty query delimiter", input({ apiUrl: "http://127.0.0.1:3100?" })],
     ["API URL with a fragment", input({ apiUrl: "http://127.0.0.1:3100#forbidden" })],
+    ["API URL with an empty fragment delimiter", input({ apiUrl: "http://127.0.0.1:3100#" })],
     ["API URL with an untrusted base path", input({ apiUrl: "http://127.0.0.1:3100/not-api" })],
   ])("rejects %s before sending a request", async (_name, unsafeInput) => {
     const calls: CapturedRequest[] = [];
 
     await expectDispositionFailure(() => finalizeOpenHandsDisposition(unsafeInput, requestThatCaptures(calls)));
+
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([
+    ["repository", { ...noChangeEvidence, repository: "untrusted worker prose" }],
+    ["base ref", { ...noChangeEvidence, base_ref: "untrusted worker prose" }],
+  ])("rejects prose-shaped %s before interpolating it into a comment", async (_name, evidence) => {
+    const calls: CapturedRequest[] = [];
+
+    await expectDispositionFailure(() => finalizeOpenHandsDisposition(input({ evidence }), requestThatCaptures(calls)));
 
     expect(calls).toHaveLength(0);
   });
@@ -156,7 +174,6 @@ describe("finalizeOpenHandsDisposition", () => {
     await pending;
 
     expect(aborted).toBe(true);
-    vi.useRealTimers();
   });
 
   it("accepts an idempotent response for the matching issue already in done", async () => {

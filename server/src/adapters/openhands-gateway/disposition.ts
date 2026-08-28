@@ -26,6 +26,17 @@ function validCommentField(value: unknown): value is string {
     && !/[\u0000-\u001f\u007f-\u009f]/.test(value) && !hasLoneSurrogate(value);
 }
 
+function validRepository(value: unknown): value is string {
+  return validCommentField(value) && Buffer.byteLength(value, "utf8") <= 128
+    && /^[A-Za-z0-9][A-Za-z0-9.-]{0,38}\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(value);
+}
+
+function validBaseRef(value: unknown): value is string {
+  return validCommentField(value) && Buffer.byteLength(value, "utf8") <= 128
+    && /^(?!.*\.\.)(?!.*(?:^|\/)\.)(?!.*\.lock(?:\/|$))[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(value)
+    && !value.endsWith("/") && !value.endsWith(".");
+}
+
 function hasLoneSurrogate(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const unit = value.charCodeAt(index);
@@ -41,13 +52,15 @@ function dispositionComment(evidence: Record<string, unknown>): string {
   const repository = evidence.repository;
   const baseRef = evidence.base_ref;
   const commit = evidence.commit;
-  if (!validCommentField(repository) || !validCommentField(baseRef) || typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) throw failure();
+  if (!validRepository(repository) || !validBaseRef(baseRef) || typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) throw failure();
   if (evidence.outcome !== undefined && evidence.outcome !== "no_change") throw failure();
   const kind = evidence.outcome === "no_change" ? "no-change" : "change";
   return `OpenHands completed with validated ${kind} evidence for ${repository} at ${baseRef} commit ${commit}.`;
 }
 
 function issueEndpoint(apiUrl: string, issueId: string): string {
+  const authority = /^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/i.exec(apiUrl)?.[1];
+  if (apiUrl.includes("?") || apiUrl.includes("#") || authority?.includes("@")) throw failure();
   const base = new URL(apiUrl);
   if ((base.protocol !== "http:" && base.protocol !== "https:") || base.username || base.password || base.search || base.hash) throw failure();
   if (base.pathname !== "/" && !base.pathname.endsWith("/api")) throw failure();
