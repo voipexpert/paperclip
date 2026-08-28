@@ -218,6 +218,7 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
       if (!settled && !cancellationStarted && !completionStarted) dispatchSent ? indeterminate() : finish(result("OPENHANDS_DISCONNECTED"));
     });
     socket.on("message", async (raw) => {
+      if (settled || completionStarted) return;
       let incoming: Record<string, unknown> | null;
       try { incoming = frame(JSON.parse(String(raw))); } catch { incoming = null; }
       if (!incoming) { finish(result("OPENHANDS_PROTOCOL")); return; }
@@ -272,8 +273,10 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
           finish(result("OPENHANDS_DISPOSITION"));
           return;
         }
-        await context.onLog("stdout", "OpenHands gateway completed.\n");
-        finish({ exitCode: 0, signal: null, timedOut: false, resultJson: frame(incoming.result)! });
+        const completed = { exitCode: 0, signal: null, timedOut: false, resultJson: frame(incoming.result)! };
+        try { await context.onLog("stdout", "OpenHands gateway completed.\n"); }
+        catch { finish(completed); return; }
+        finish(completed);
       } else {
         if (completionStarted) return;
         if (incoming.status === "indeterminate") { indeterminate("gateway_indeterminate"); return; }

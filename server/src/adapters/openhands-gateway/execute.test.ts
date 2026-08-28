@@ -519,6 +519,8 @@ describe("OpenHands gateway contract", () => {
     const firstDispositionReceived = new Promise<void>((resolve) => { firstDispositionSeen = resolve; });
     let duplicateSent!: () => void;
     const duplicateCompletedFrameSent = new Promise<void>((resolve) => { duplicateSent = resolve; });
+    let duplicateFrameObserved!: () => void;
+    const duplicateFrameObservation = new Promise<void>((resolve) => { duplicateFrameObserved = resolve; });
     const requests: Array<{ authorization: string | undefined; body: string }> = [];
     const api = await paperclipApi(async (request, response, body) => {
       requests.push({ authorization: request.headers.authorization, body });
@@ -537,14 +539,16 @@ describe("OpenHands gateway contract", () => {
         setImmediate(() => {
           socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, status: "completed", result: completedEvidence() }));
           duplicateSent();
+          socket.ping();
         });
+        socket.on("pong", () => duplicateFrameObserved());
       });
     });
     try {
       const resultPromise = execute(context(testGateway.port));
       await firstDispositionReceived;
       await duplicateCompletedFrameSent;
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      await duplicateFrameObservation;
       expect(requests).toHaveLength(1);
       expect(requests[0]?.authorization).toBe(`Bearer ${RUN_AUTH_TOKEN}`);
       expect(JSON.parse(requests[0]?.body ?? "")).toMatchObject({ status: "done" });
@@ -560,13 +564,15 @@ describe("OpenHands gateway contract", () => {
     }
   });
 
-  it("ignores subsequent correlated terminal frames after validated completion starts disposition", async () => {
+  it("ignores malformed frames and contradictory acknowledgements after validated completion starts disposition", async () => {
     await setGatewayToken();
     const logs: Array<[string, string]> = [];
     let releaseDisposition!: () => void;
     const dispositionReleased = new Promise<void>((resolve) => { releaseDisposition = resolve; });
     let dispositionSeen!: () => void;
     const dispositionReceived = new Promise<void>((resolve) => { dispositionSeen = resolve; });
+    let laterFramesObserved!: () => void;
+    const laterFrameObservation = new Promise<void>((resolve) => { laterFramesObserved = resolve; });
     const requests: Array<{ authorization: string | undefined; body: string }> = [];
     const api = await paperclipApi(async (request, response, body) => {
       requests.push({ authorization: request.headers.authorization, body });
@@ -583,14 +589,18 @@ describe("OpenHands gateway contract", () => {
         socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: true, duplicate: false, state: "accepted" }));
         socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, status: "completed", result: completedEvidence() }));
         setImmediate(() => {
-          socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, status: "failed", result: { code: "validation" } }));
+          socket.send("{");
+          socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: false, reason: "busy" }));
+          socket.send(JSON.stringify({ type: "run_event", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, state: "running", timestamp: "invalid" }));
+          socket.ping();
         });
+        socket.on("pong", () => laterFramesObserved());
       });
     });
     try {
       const resultPromise = execute({ ...context(testGateway.port), onLog: async (stream, line) => { logs.push([stream, line]); } });
       await dispositionReceived;
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      await laterFrameObservation;
       expect(logs).toEqual([["stdout", "OpenHands gateway dispatch accepted.\n"]]);
       releaseDisposition();
       await expect(resultPromise).resolves.toMatchObject({ exitCode: 0, timedOut: false, resultJson: completedEvidence() });
@@ -598,6 +608,35 @@ describe("OpenHands gateway contract", () => {
       expect(logs).toEqual([["stdout", "OpenHands gateway dispatch accepted.\n"], ["stdout", "OpenHands gateway completed.\n"]]);
     } finally {
       releaseDisposition?.();
+      await testGateway.close();
+      await api.close();
+    }
+  });
+
+  it("settles successfully when completion logging rejects after disposition", async () => {
+    await setGatewayToken();
+    const api = await successfulPaperclipApi();
+    process.env.PAPERCLIP_API_URL = api.url;
+    const testGateway = await gateway((socket) => {
+      socket.send(JSON.stringify({ type: "hello", version: 1 }));
+      socket.on("message", (raw) => {
+        const dispatch = JSON.parse(String(raw));
+        socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: true, duplicate: false, state: "accepted" }));
+        socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, status: "completed", result: completedEvidence() }));
+      });
+    });
+    try {
+      const outcome = await Promise.race([
+        execute({ ...context(testGateway.port), onLog: async (_stream, line) => {
+          if (line === "OpenHands gateway completed.\n") throw new Error("logging unavailable");
+        } }).then((result) => ({ kind: "result" as const, result })),
+        new Promise<{ kind: "timeout" }>((resolve) => setTimeout(() => resolve({ kind: "timeout" }), 100)),
+      ]);
+      expect(outcome).toEqual({
+        kind: "result",
+        result: { exitCode: 0, signal: null, timedOut: false, resultJson: completedEvidence() },
+      });
+    } finally {
       await testGateway.close();
       await api.close();
     }
