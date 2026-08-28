@@ -167,6 +167,10 @@ import {
 } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
+  OPENHANDS_DISPOSITION_REJECTION,
+  openHandsDispositionEvidenceSchema,
+} from "../adapters/openhands-gateway/disposition-contract.js";
+import {
   GENERIC_ATTACHMENT_CONTENT_TYPES,
   isInlineAttachmentContentType,
   normalizeIssueAttachmentMaxBytes,
@@ -9353,6 +9357,38 @@ export function issueRoutes(
         action: req.body.action,
         comment: result.comment,
         wakeQueued,
+      });
+    },
+  );
+
+  router.post(
+    "/issues/:id/openhands-disposition",
+    validate(openHandsDispositionEvidenceSchema),
+    async (req, res) => {
+      if (
+        req.actor.type !== "agent"
+        || req.actor.source !== "agent_jwt"
+        || !req.actor.agentId
+        || !req.actor.companyId
+        || !req.actor.runId
+      ) {
+        res.status(403).json({ error: OPENHANDS_DISPOSITION_REJECTION });
+        return;
+      }
+
+      const result = await svc.finalizeOpenHandsDisposition({
+        issueId: req.params.id as string,
+        companyId: req.actor.companyId,
+        agentId: req.actor.agentId,
+        runId: req.actor.runId,
+        onBehalfOfUserId: req.actor.onBehalfOfUserId,
+        evidence: req.body,
+      });
+      res.json({
+        id: result.issue.id,
+        status: result.issue.status,
+        replayed: result.replayed,
+        commentId: result.comment.id,
       });
     },
   );

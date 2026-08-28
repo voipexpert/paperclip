@@ -184,7 +184,7 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
     let dispatchSent = false;
     let acknowledged = false;
     let acknowledgement: string | null = null;
-    let completionStarted = false;
+    let terminalStarted = false;
     let cancellationStarted = false;
     let cancelWaitTimer: ReturnType<typeof setTimeout> | null = null;
     const finish = (value: AdapterExecutionResult) => {
@@ -211,17 +211,18 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
     }, config.timeoutMs);
 
     socket.on("error", () => {
-      if (cancellationStarted || completionStarted) return;
+      if (cancellationStarted || terminalStarted) return;
       dispatchSent ? indeterminate() : finish(result("OPENHANDS_UNREACHABLE"));
     });
     socket.on("close", () => {
-      if (!settled && !cancellationStarted && !completionStarted) dispatchSent ? indeterminate() : finish(result("OPENHANDS_DISCONNECTED"));
+      if (!settled && !cancellationStarted && !terminalStarted) dispatchSent ? indeterminate() : finish(result("OPENHANDS_DISCONNECTED"));
     });
     socket.on("message", async (raw) => {
-      if (settled || completionStarted) return;
+      if (settled || terminalStarted) return;
       let incoming: Record<string, unknown> | null;
       try { incoming = frame(JSON.parse(String(raw))); } catch { incoming = null; }
       if (!incoming) { finish(result("OPENHANDS_PROTOCOL")); return; }
+      if (cancellationStarted && incoming.type !== "run_result") return;
       if (incoming.type === "hello") {
         if (!isHello(incoming)) { finish(result("OPENHANDS_PROTOCOL")); return; }
         if (dispatched) return;
@@ -240,7 +241,13 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
           if (signature !== acknowledgement) finish({ ...result("OPENHANDS_PROTOCOL"), clearSession: false, resultJson: { state: "indeterminate", reason: "ack_contradiction" } });
           return;
         }
-        if (incoming.accepted === false) { await context.onLog("stderr", "OpenHands gateway dispatch rejected.\n"); finish(result(incoming.reason === "busy" ? "OPENHANDS_BUSY" : "OPENHANDS_REJECTED")); return; }
+        if (incoming.accepted === false) {
+          terminalStarted = true;
+          clearTimeout(deadlineTimer);
+          await context.onLog("stderr", "OpenHands gateway dispatch rejected.\n");
+          finish(result(incoming.reason === "busy" ? "OPENHANDS_BUSY" : "OPENHANDS_REJECTED"));
+          return;
+        }
         acknowledged = true;
         acknowledgement = signature;
         await context.onLog("stdout", "OpenHands gateway dispatch accepted.\n");
@@ -258,10 +265,10 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
       }
       if (!matches(incoming, dispatch)) return;
       if (!acknowledged) { finish(result("OPENHANDS_PROTOCOL")); return; }
+      if (cancellationStarted && incoming.status === "completed") return;
+      terminalStarted = true;
+      clearTimeout(deadlineTimer);
       if (incoming.status === "completed") {
-        if (completionStarted) return;
-        completionStarted = true;
-        clearTimeout(deadlineTimer);
         try {
           await finalizeOpenHandsDisposition({
             issueId: issue.id,
@@ -278,7 +285,6 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
         catch { finish(completed); return; }
         finish(completed);
       } else {
-        if (completionStarted) return;
         if (incoming.status === "indeterminate") { indeterminate("gateway_indeterminate"); return; }
         const code = incoming.status === "failed" ? "OPENHANDS_FAILED" : incoming.status === "cancelled" ? "OPENHANDS_CANCELLED" : "OPENHANDS_TIMEOUT";
         await context.onLog("stderr", `OpenHands gateway ${incoming.status}.\n`);

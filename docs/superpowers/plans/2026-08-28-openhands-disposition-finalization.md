@@ -1,199 +1,119 @@
 # OpenHands Disposition Finalization Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Use `superpowers:executing-plans`, strict test-driven development, and Node 26 (`PATH=/opt/homebrew/bin:$PATH`).
 
-**Goal:** Make a validated OpenHands gateway completion atomically useful to Paperclip by recording the assigned issue's done disposition before adapter success.
+**Goal:** Record a validated OpenHands completion as one authenticated, run-conditioned, atomic and idempotent Paperclip disposition before adapter success.
 
-**Architecture:** Add a focused server-side disposition client and call it once from the OpenHands adapter's validated-completion path. The client uses only the per-run Paperclip auth token and server-owned API URL, performs a bounded authenticated PATCH, and returns success only after Paperclip confirms the same issue is done.
+**Architecture:** The adapter calls `POST /api/issues/{issueId}/openhands-disposition` with a strict bounded evidence tuple. Real local-JWT middleware supplies the actor. The issue service locks the issue row, validates live ownership/execution locks, and commits `done` plus one exact run-attributed receipt comment in a single transaction. The client confirms the matching issue/status under existing redirect, deadline, body-size, UTF-8, and fixed-error protections.
 
-**Tech Stack:** TypeScript, Node 24 native `fetch`/Web Streams/`AbortSignal`, Vitest, pnpm.
+**Tech Stack:** TypeScript, Express, Drizzle/PostgreSQL, Node 26 native fetch/Web Streams, Vitest, pnpm.
 
 ## Global constraints
 
-- Keep Paperclip credentials inside the Paperclip server. Never send them to OpenHands, Canvas, the coding VM, GitHub, logs, comments, or result evidence.
-- Use only the existing per-run `context.authToken` and server-owned `PAPERCLIP_API_URL`.
-- Mutate Paperclip only after correlated OpenHands evidence has passed all existing completion validation.
-- Do not mutate issue state for failure, cancellation, timeout, malformed evidence, or any other non-completion outcome.
-- The Paperclip comment must be deterministic and built only from validated repository, base-ref, commit, and change/no-change state. Never copy the worker's free-form summary.
-- Reject redirects. Bound the request to 10 seconds and the response to 65,536 bytes. Decode UTF-8 fatally and validate the response issue ID and `done` status.
-- Convert every disposition failure to the fixed adapter error `OPENHANDS_DISPOSITION`; do not leak response bodies, URLs containing credentials, tokens, or underlying error details.
-- Preserve all existing gateway protocol, replay, recovery, timeout, pause, and ledger semantics.
-- Keep the coding VM unchanged. Only the final explicitly approved read-only snapshot may touch it.
-- Implement with tests first, small commits, independent review, and fresh verification before merge or deployment.
+- Keep all work local to the assigned worktree. Do not contact or mutate any remote, production service, VM, GitHub, Paperclip deployment, Canvas, OpenHands deployment, or coding VM.
+- Keep the heartbeat JWT server-only. Never send it to the gateway/WebSocket, adapter config/context serialization, logs, result JSON/evidence, or worker.
+- Derive company, agent, and run identity only from a verified local-agent JWT actor. Reject board actors, API-key actors, missing run claims, and request identity fields.
+- Accept only strict bounded evidence fields and construct the deterministic comment server-side. Never accept or copy free-form summary/comment text.
+- First execution requires live `in_progress` status, actor assignment, actor `checkoutRunId`, actor `executionRunId`, and a present execution lock.
+- Commit `done` and one receipt comment atomically. A same-run exact-evidence replay may return the existing receipt without a new comment; all stale or mismatched requests fail with a fixed response and no mutation.
+- Preserve redirect rejection, 10,000 ms deadline, 65,536-byte response limit, fatal UTF-8, response identity/status confirmation, fixed errors, and timer cleanup.
+- Follow RED → minimal GREEN → refactor for every production behavior.
 
-## Task 1: Build the bounded Paperclip disposition client
+## Task 1: Amend and pin the architecture
 
 **Files:**
 
-- Create: `server/src/adapters/openhands-gateway/disposition.ts`
-- Create: `server/src/adapters/openhands-gateway/disposition.test.ts`
+- Modify `docs/superpowers/specs/2026-08-28-openhands-disposition-finalization-design.md`
+- Modify `docs/superpowers/plans/2026-08-28-openhands-disposition-finalization.md`
 
-- [ ] Write a failing happy-path test that injects a request function, captures exactly one `PATCH` to `http://127.0.0.1:3100/api/issues/task-1`, and verifies `Authorization: Bearer run-token`, JSON content type, `status: "done"`, and this deterministic no-change comment:
+- [ ] Replace the generic PATCH design with the approved dedicated endpoint and transaction invariants.
+- [ ] Document the exact receipt, replay, stale-state, terminal-race, evidence, and token-isolation rules.
+- [ ] State explicitly that this fix wave performs no remote or production action.
 
-  ```text
-  OpenHands completed with validated no-change evidence for voipexpert/openhands-worker-acceptance at main commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.
-  ```
-
-- [ ] Add a changed-evidence case using the fixed phrase `validated change evidence`, and prove an arbitrary evidence `summary` string is never copied into the request.
-
-- [ ] Add failing validation tests for missing/blank auth token; missing or malformed API URL; non-HTTP(S) schemes; URL credentials, query, or fragment; and a base path other than empty, `/`, or one ending in `/api`.
-
-- [ ] Add failing response tests for redirects, non-2xx responses, an incrementally streamed body over 65,536 bytes, invalid UTF-8, malformed JSON, mismatched issue ID, and any returned status other than `done`.
-
-- [ ] Add a timeout/abort test and a case proving a matching issue already in `done` is accepted.
-
-- [ ] Run the focused test and confirm the new suite fails because the module is absent:
-
-  ```bash
-  pnpm exec vitest run server/src/adapters/openhands-gateway/disposition.test.ts
-  ```
-
-- [ ] Implement this public surface:
-
-  ```ts
-  export class OpenHandsDispositionError extends Error {}
-
-  export async function finalizeOpenHandsDisposition(
-    input: {
-      issueId: string;
-      evidence: Record<string, unknown>;
-      authToken: string | undefined;
-      apiUrl: string | undefined;
-    },
-    request: typeof fetch = globalThis.fetch,
-  ): Promise<void>;
-  ```
-
-- [ ] Define `RESPONSE_LIMIT = 65_536` and `REQUEST_TIMEOUT_MS = 10_000`. Normalize an allowed API base to a single `/api/issues/{encodedIssueId}` target, set `redirect: "error"`, and use an abort signal.
-
-- [ ] Read the response body incrementally, cancel once it exceeds the limit, decode it with fatal UTF-8 handling, parse JSON, and require the returned object to identify the same issue with status `done`.
-
-- [ ] Ensure every rejection is a fresh fixed `OpenHandsDispositionError` without a `cause` or sensitive detail.
-
-- [ ] Run focused tests and server type checking:
-
-  ```bash
-  pnpm exec vitest run server/src/adapters/openhands-gateway/disposition.test.ts
-  pnpm --filter @paperclipai/server typecheck
-  git diff --check
-  ```
-
-- [ ] Commit the isolated client and tests:
-
-  ```bash
-  git add server/src/adapters/openhands-gateway/disposition.ts server/src/adapters/openhands-gateway/disposition.test.ts
-  git commit -m "feat(openhands): add bounded issue disposition client"
-  ```
-
-## Task 2: Gate adapter success on issue disposition
+## Task 2: Enable and prove server-only run JWT delivery
 
 **Files:**
 
-- Modify: `server/src/adapters/openhands-gateway/execute.ts`
-- Modify: `server/src/adapters/openhands-gateway/execute.test.ts`
+- Modify `server/src/__tests__/adapter-registry.test.ts`
+- Modify `server/src/__tests__/heartbeat-runtime-skills.test.ts`
+- Modify `server/src/adapters/registry.ts`
+- Modify `server/src/adapters/openhands-gateway/execute.test.ts`
 
-- [ ] Extend the adapter test context with a per-run auth token and save/restore `PAPERCLIP_API_URL` around every test.
+- [ ] RED: require the built-in OpenHands adapter to declare local-agent JWT support.
+- [ ] RED: run a real embedded-database heartbeat through the registry boundary, verify the captured token claims match agent/company/run/adapter, and prove serialized adapter inputs/log/result evidence exclude it.
+- [ ] GREEN: set only the built-in capability needed for heartbeat minting.
+- [ ] Verify gateway dispatch and gateway authorization still contain only the gateway credential and bounded dispatch fields.
 
-- [ ] Add a local HTTP-server test that defers its response. Assert the adapter promise remains pending and no completion log is emitted until Paperclip confirms the issue is done.
+## Task 3: Add the transactional disposition operation
 
-- [ ] Add a duplicate-completed-frame test and assert exactly one disposition PATCH.
+**Files:**
 
-- [ ] Add failure tests for missing auth, missing API URL, and any disposition-client rejection. Each must return the fixed `OPENHANDS_DISPOSITION` error after validated completion and must not leak details.
+- Create `server/src/adapters/openhands-gateway/disposition-contract.ts`
+- Modify `server/src/services/issues.ts`
+- Modify `server/src/routes/issues.ts`
+- Create `server/src/__tests__/openhands-disposition-route.test.ts`
 
-- [ ] Add a parameterized test proving every non-completion outcome performs zero disposition requests.
+- [ ] RED: exercise real local-JWT authentication and require the dedicated route to atomically persist `done` plus one exact agent/run-attributed bounded comment.
+- [ ] RED: prove response-loss replay returns success with one comment and mismatched replay evidence fails without mutation.
+- [ ] RED: cover cancelled, reassigned, wrong-run, wrong-agent, missing checkout/execution lock, and no-lock states with one fixed rejection.
+- [ ] RED: prove a forced comment-insert failure rolls back the status transition.
+- [ ] GREEN: add a strict bounded evidence schema and server-side deterministic comment builder.
+- [ ] GREEN: lock the issue row, use the existing issue update/comment attribution primitives in one transaction, and use the exact marked comment as the receipt.
+- [ ] GREEN: accept only `agent_jwt` actors and pass only actor-derived identity into the service.
+- [ ] Verify the persisted `done` issue makes successful-run handoff recovery skip corrective wake creation.
+- [ ] Confirm no migration is needed; if the receipt cannot satisfy atomic idempotence, stop and add only the smallest schema/index change through the normal migration workflow.
 
-- [ ] Run the focused adapter test and confirm the new assertions fail before production code changes:
+## Task 4: Switch the bounded client to the dedicated contract
 
-  ```bash
-  pnpm exec vitest run server/src/adapters/openhands-gateway/execute.test.ts
-  ```
+**Files:**
 
-- [ ] Import `finalizeOpenHandsDisposition`, define the fixed disposition error result, and add a per-execution `completionStarted` guard.
+- Modify `server/src/adapters/openhands-gateway/disposition.test.ts`
+- Modify `server/src/adapters/openhands-gateway/disposition.ts`
+- Modify `server/src/adapters/openhands-gateway/contract.ts`
 
-- [ ] In the existing validated `completed` branch only: return immediately for a duplicate frame; set the guard; clear the deadline timer; await disposition using `issue.id`, the validated result evidence, `context.authToken`, and `process.env.PAPERCLIP_API_URL`; map failure to `OPENHANDS_DISPOSITION`; then emit the existing completion log and finish successfully.
+- [ ] RED: require one `POST` to the dedicated endpoint with only `outcome`, `repository`, `baseRef`, and `commit`; prove gateway summary is absent.
+- [ ] RED: require Git-ref punctuation such as `release/v1+meta` to pass and unsafe/control input to fail before a request.
+- [ ] GREEN: reuse the shared disposition contract in config validation, completion validation, client request construction, and route validation.
+- [ ] Preserve percent-encoded issue paths, bearer authorization, JSON content type, redirect rejection, and fixed errors.
 
-- [ ] Leave all correlation, evidence validation, ledger, replay, failure, cancellation, recovery, and timeout branches unchanged.
+## Task 5: Close terminal and cancellation races
 
-- [ ] Run focused and regression tests plus type checking:
+**Files:**
 
-  ```bash
-  pnpm exec vitest run server/src/adapters/openhands-gateway/disposition.test.ts server/src/adapters/openhands-gateway/execute.test.ts
-  pnpm exec vitest run server/src/services/recovery/successful-run-handoff.test.ts server/src/services/recovery/service.pause-durability.test.ts server/src/__tests__/heartbeat-retry-scheduling.test.ts
-  pnpm --filter @paperclipai/server typecheck
-  git diff --check
-  ```
+- Modify `server/src/adapters/openhands-gateway/execute.test.ts`
+- Modify `server/src/adapters/openhands-gateway/execute.ts`
 
-- [ ] Commit the adapter integration:
+- [ ] RED: block a failure/cancel/timeout log, send a conflicting completion, synchronize on the log attempt, and require zero disposition requests.
+- [ ] RED: with fake timers, start local cancellation and then deliver completed evidence; require zero disposition requests.
+- [ ] RED: define the completion/deadline race policy: the callback that synchronously latches first wins.
+- [ ] GREEN: set one common terminal guard synchronously before every await and reject messages after local cancellation begins.
+- [ ] Remove the 100 ms rejecting-log race by synchronizing on the completion-log attempt and awaiting normal promise settlement, using only the test runner timeout as an outer bound.
 
-  ```bash
-  git add server/src/adapters/openhands-gateway/execute.ts server/src/adapters/openhands-gateway/execute.test.ts
-  git commit -m "feat(openhands): finalize issue before adapter success"
-  ```
+## Task 6: Pin exact client bounds and native-fetch behavior
 
-## Task 3: Review, merge, and deploy Paperclip immutably
+**Files:**
 
-- [ ] Run the complete pre-review verification from a clean branch:
+- Modify `server/src/adapters/openhands-gateway/disposition.test.ts`
+- Modify `server/src/adapters/openhands-gateway/disposition.ts` only if a new focused test is RED.
 
-  ```bash
-  pnpm exec vitest run server/src/adapters/openhands-gateway/disposition.test.ts server/src/adapters/openhands-gateway/execute.test.ts
-  pnpm exec vitest run server/src/services/recovery/successful-run-handoff.test.ts server/src/services/recovery/service.pause-durability.test.ts server/src/__tests__/heartbeat-retry-scheduling.test.ts
-  pnpm --filter @paperclipai/server typecheck
-  pnpm --filter @paperclipai/server build
-  git diff --check origin/master...HEAD
-  git status --short
-  ```
+- [ ] Test a valid success body of exactly 65,536 bytes and rejection at 65,537 bytes.
+- [ ] With fake timers, prove no abort at 9,999 ms and abort at 10,000 ms.
+- [ ] Prove the deadline timer is cleared after success and failure.
+- [ ] Add native-fetch local-server coverage for redirects and headers-arrive/body-stalls timeout behavior.
+- [ ] Make only the minimal production adjustment required by an observed RED.
 
-- [ ] Dispatch two independent read-only reviews: one for correctness/security against the approved design, and one for test quality/regression risk. Address findings with test-first follow-up commits and repeat verification.
+## Task 7: Verification, report, and commit
 
-- [ ] Push the feature branch, open a PR with the design and verification evidence, wait for required checks, and merge only after both independent reviews pass.
+- [ ] Run focused disposition/execute/registry/heartbeat/route/recovery suites under Node 26.
+- [ ] Run the current recovery regression suites named by the prior verified reports.
+- [ ] Run server typecheck, server build, `git diff --check`, and the broad Vitest command appropriate to the final diff.
+- [ ] Review the complete diff for token leakage, response/body leakage, stale-state mutation, duplicate receipts, identity fields, unintended route authorization, and unrelated changes.
+- [ ] Write `.superpowers/sdd/2026-08-28-openhands-disposition-finalization/final-fix-report.md` with files/architecture, RED evidence per finding, GREEN commands/counts, integration coverage, migrations, commits, and self-review.
+- [ ] Commit the complete fix wave locally. Do not push or open a PR.
 
-- [ ] Record the exact merged commit and create an immutable source archive from that commit. Verify its checksum before deployment; do not deploy a mutable checkout or run `git pull` on the host.
+## Acceptance checklist
 
-- [ ] Confirm the OpenHands worker is paused and the sanitized gateway ledger has zero active attempts.
-
-- [ ] On `plane` only, build a versioned Paperclip image/release from the verified archive, record the image ID and release metadata, deploy only Paperclip, and verify its health/version. Preserve the prior image/release for rollback.
-
-- [ ] Confirm Canvas automations remain disabled with zero runs, OpenHands remains paused, and the coding VM was not contacted.
-
-## Task 4: Run production acceptance and close out safely
-
-- [ ] Preserve and validate the VTH-20 evidence, then cancel/unassign the issue if still needed. Validate the exact known VTH-20 workspaces before removing only those two paths:
-
-  ```text
-  pc-37cbae83d121efe8ae82
-  pc-b8b935ea8656f1ba1588
-  ```
-
-- [ ] Create one fresh acceptance canary against `voipexpert/openhands-worker-acceptance` at baseline `50593c91e35ae333e8ba5010d2ac16403cab94d9`, assign only the OpenHands worker, resume it for the canary, and enforce a 660-second bound.
-
-- [ ] Require all of the following before acceptance: exactly one new completed gateway-ledger row; zero active rows; one new workspace and one conversation; valid correlated no-change evidence for repository `voipexpert/openhands-worker-acceptance`, base ref `main`, and the baseline commit; a successful Paperclip run; issue status `done`; and no corrective retry or missing-disposition activity.
-
-- [ ] Replay the exact same signed envelope and verify idempotence: no new ledger row, workspace, conversation, GitHub mutation, or issue transition.
-
-- [ ] Compare GitHub with the recorded baseline: 8 branches, 5 open PRs, 2 open non-PR issues, and unchanged acceptance-repository commit. Confirm Canvas automations are still disabled with zero runs.
-
-- [ ] Run final health and security attestations for Paperclip, OpenHands, CLIProxyAPI integration, the sanitized gateway ledger, service identities, release/image IDs, firewall/reachability, and exact disposable-workspace ownership/modes. Do not print secrets, raw environments, raw logs, or free-form worker prompts/summaries.
-
-- [ ] Take the single approved final read-only coding-VM snapshot and confirm no changes were made there.
-
-- [ ] Leave the worker active only if it is idle and has no actionable assigned issues; otherwise leave it paused and report the reason.
-
-- [ ] Revoke the temporary Paperclip CLI authentication with `/api/cli-auth/revoke-current`, delete only the exact temporary auth file, and verify it no longer exists. Never print its token.
-
-- [ ] Deliver the merged commit, deployed release/image identifiers, sanitized acceptance counts, rollback reference, final worker state, and any remaining operational caveat.
-
-## Plan acceptance checklist
-
-- [ ] Confirm every approved design requirement maps to a test or production acceptance assertion above.
-- [ ] Confirm no placeholder language remains:
-
-  ```bash
-  rg -n 'T[B]D|T[O]DO|i[m]plement later|f[i]ll in details|S[i]milar to Task' docs/superpowers/plans/2026-08-28-openhands-disposition-finalization.md
-  ```
-
-- [ ] Confirm formatting and repository state:
-
-  ```bash
-  git diff --check
-  git status --short
-  ```
+- [ ] Every final-review finding maps to a focused test or an explicitly documented no-production-change coverage addition.
+- [ ] No placeholders remain in this plan or design.
+- [ ] No secret, raw environment, raw remote response, worker summary, or token appears in logs, dispatch, evidence, report, or git diff.
+- [ ] `git diff --check` and `git status --short` show only the intended local fix wave before commit.

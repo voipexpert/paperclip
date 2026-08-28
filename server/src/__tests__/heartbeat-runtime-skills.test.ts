@@ -15,6 +15,7 @@ import {
   toolProfileBindings,
   toolProfileEntries,
   toolProfiles,
+  heartbeatRuns,
 } from "@paperclipai/db";
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import type { PaperclipSkillEntry } from "@paperclipai/adapter-utils/server-utils";
@@ -25,7 +26,8 @@ import {
 import { companySkillService } from "../services/company-skills.ts";
 import { heartbeatService, runtimeConfigForAdapterExecution } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
-import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
+import { findServerAdapter, registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
+import { verifyLocalAgentJwt } from "../agent-auth-jwt.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -74,6 +76,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let oldPaperclipHome: string | undefined;
   let oldPaperclipApiUrl: string | undefined;
+  let oldAgentJwtSecret: string | undefined;
   let paperclipHome: string | null = null;
   const capturedRuns: Array<{
     agentId: string;
@@ -96,6 +99,8 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     // a deterministic value for tests that never boot the full server.
     oldPaperclipApiUrl = process.env.PAPERCLIP_API_URL;
     process.env.PAPERCLIP_API_URL = "http://127.0.0.1:3100/api";
+    oldAgentJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "openhands-heartbeat-boundary-test-secret";
     registerServerAdapter({
       type: TEST_ADAPTER_TYPE,
       execute: async (ctx) => {
@@ -158,6 +163,8 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     else process.env.PAPERCLIP_HOME = oldPaperclipHome;
     if (oldPaperclipApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
     else process.env.PAPERCLIP_API_URL = oldPaperclipApiUrl;
+    if (oldAgentJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldAgentJwtSecret;
     if (paperclipHome) {
       await fs.rm(paperclipHome, { recursive: true, force: true });
     }
@@ -170,8 +177,12 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     let capturedConfig: Record<string, unknown> | null = null;
     let capturedRuntimeSpecConfig: Record<string, unknown> | null = null;
     let capturedContext: Record<string, unknown> | null = null;
+    let capturedAuthToken: string | undefined;
+    const builtIn = findServerAdapter("openhands_gateway");
+    expect(builtIn).not.toBeNull();
     registerServerAdapter({
       type: "openhands_gateway",
+      supportsLocalAgentJwt: builtIn!.supportsLocalAgentJwt,
       getRuntimeCommandSpec: (config) => {
         capturedRuntimeSpecConfig = config;
         return null;
@@ -179,7 +190,15 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       execute: async (ctx) => {
         capturedConfig = ctx.config;
         capturedContext = ctx.context;
-        return { exitCode: 0, signal: null, timedOut: false, label: "Captured OpenHands config" };
+        capturedAuthToken = ctx.authToken;
+        await ctx.onLog("stdout", `${JSON.stringify({ config: ctx.config, context: ctx.context })}\n`);
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          label: "Captured OpenHands config",
+          resultJson: { outcome: "token-free" },
+        };
       },
       testEnvironment: async () => ({
         adapterType: "openhands_gateway",
@@ -230,6 +249,21 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       expect(capturedConfig).toEqual(expectedConfig);
       expect(capturedRuntimeSpecConfig).toEqual(expectedConfig);
       expect(capturedContext).not.toHaveProperty("paperclipScratch");
+      expect(capturedAuthToken).toBeTypeOf("string");
+      const claims = verifyLocalAgentJwt(capturedAuthToken!);
+      expect(claims).toMatchObject({
+        sub: agentId,
+        company_id: companyId,
+        adapter_type: "openhands_gateway",
+        run_id: run!.id,
+      });
+      const [persistedRun, log] = await Promise.all([
+        db.select({ resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id)).then((rows) => rows[0]),
+        heartbeat.readLog(run!.id),
+      ]);
+      expect(JSON.stringify({ config: capturedConfig, context: capturedContext })).not.toContain(capturedAuthToken!);
+      expect(JSON.stringify(persistedRun?.resultJson)).not.toContain(capturedAuthToken!);
+      expect(log.content).not.toContain(capturedAuthToken!);
     } finally {
       unregisterServerAdapter("openhands_gateway");
     }

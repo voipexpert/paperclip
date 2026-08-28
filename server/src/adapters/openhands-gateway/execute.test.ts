@@ -69,6 +69,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  vi.unstubAllGlobals();
   if (originalTokenFile === undefined) delete process.env.OPENHANDS_GATEWAY_TOKEN_FILE;
   else process.env.OPENHANDS_GATEWAY_TOKEN_FILE = originalTokenFile;
   if (originalPaperclipApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
@@ -193,6 +194,35 @@ async function successfulPaperclipApi(requests: Array<{ authorization: string | 
 }
 
 describe("OpenHands gateway contract", () => {
+  it("uses the disposition repository/ref grammar before dispatch", () => {
+    const valid = parseOpenHandsConfig({
+      url: "wss://gateway.example/paperclip-worker/v1",
+      timeoutSec: 60,
+      projectTargets: {
+        project: {
+          repository: "voipexpert/openhands-worker-acceptance",
+          baseRef: "release/v1+meta",
+          profile: "openhands",
+        },
+      },
+    });
+    expect(valid).not.toBeInstanceOf(Error);
+    if (valid instanceof Error) throw valid;
+    expect(valid.projectTargets.project?.baseRef).toBe("release/v1+meta");
+
+    for (const target of [
+      { repository: "unsafe repository", baseRef: "main", profile: "openhands" },
+      { repository: "owner/repo", baseRef: "release/v1\nmain", profile: "openhands" },
+      { repository: "owner/repo", baseRef: "release/../main", profile: "openhands" },
+    ]) {
+      expect(parseOpenHandsConfig({
+        url: "wss://gateway.example/paperclip-worker/v1",
+        timeoutSec: 60,
+        projectTargets: { project: target },
+      })).toBeInstanceOf(Error);
+    }
+  });
+
   it("reads only the Plane group credential and builds dispatch exclusively from mapped project fields", async () => {
     await setGatewayToken();
     const token = readGatewayToken(process.env, credentialSecurity());
@@ -498,7 +528,12 @@ describe("OpenHands gateway contract", () => {
       expect(logs).toEqual([["stdout", "OpenHands gateway dispatch accepted.\n"]]);
       expect(requests).toHaveLength(1);
       expect(requests[0]?.authorization).toBe(`Bearer ${RUN_AUTH_TOKEN}`);
-      expect(JSON.parse(requests[0]?.body ?? "")).toMatchObject({ status: "done" });
+      expect(JSON.parse(requests[0]?.body ?? "")).toEqual({
+        outcome: "change",
+        repository: "voipexpert/openhands-worker-acceptance",
+        baseRef: "main",
+        commit: "a".repeat(40),
+      });
 
       releaseDisposition();
 
@@ -511,7 +546,7 @@ describe("OpenHands gateway contract", () => {
     }
   });
 
-  it("issues exactly one disposition PATCH for duplicate completed frames", async () => {
+  it("issues exactly one disposition POST for duplicate completed frames", async () => {
     await setGatewayToken();
     let releaseDisposition!: () => void;
     const dispositionReleased = new Promise<void>((resolve) => { releaseDisposition = resolve; });
@@ -551,7 +586,12 @@ describe("OpenHands gateway contract", () => {
       await duplicateFrameObservation;
       expect(requests).toHaveLength(1);
       expect(requests[0]?.authorization).toBe(`Bearer ${RUN_AUTH_TOKEN}`);
-      expect(JSON.parse(requests[0]?.body ?? "")).toMatchObject({ status: "done" });
+      expect(JSON.parse(requests[0]?.body ?? "")).toEqual({
+        outcome: "change",
+        repository: "voipexpert/openhands-worker-acceptance",
+        baseRef: "main",
+        commit: "a".repeat(40),
+      });
 
       releaseDisposition();
 
@@ -626,15 +666,20 @@ describe("OpenHands gateway contract", () => {
       });
     });
     try {
-      const outcome = await Promise.race([
-        execute({ ...context(testGateway.port), onLog: async (_stream, line) => {
-          if (line === "OpenHands gateway completed.\n") throw new Error("logging unavailable");
-        } }).then((result) => ({ kind: "result" as const, result })),
-        new Promise<{ kind: "timeout" }>((resolve) => setTimeout(() => resolve({ kind: "timeout" }), 100)),
-      ]);
-      expect(outcome).toEqual({
-        kind: "result",
-        result: { exitCode: 0, signal: null, timedOut: false, resultJson: completedEvidence() },
+      let completionLogAttempted!: () => void;
+      const completionLogAttempt = new Promise<void>((resolve) => { completionLogAttempted = resolve; });
+      const resultPromise = execute({ ...context(testGateway.port), onLog: async (_stream, line) => {
+          if (line === "OpenHands gateway completed.\n") {
+            completionLogAttempted();
+            throw new Error("logging unavailable");
+          }
+        } });
+      await completionLogAttempt;
+      await expect(resultPromise).resolves.toEqual({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        resultJson: completedEvidence(),
       });
     } finally {
       await testGateway.close();
@@ -852,6 +897,64 @@ describe("OpenHands gateway contract", () => {
     }
   });
 
+  it.each([
+    ["failed", "validation", "OPENHANDS_FAILED"],
+    ["cancelled", "cancelled_by_request", "OPENHANDS_CANCELLED"],
+    ["timed_out", "timeout", "OPENHANDS_TIMEOUT"],
+  ] as const)("latches a %s terminal frame before logging so later completion cannot disposition", async (status, code, errorCode) => {
+    await setGatewayToken();
+    const dispositionRequest = vi.fn(async () => new Response(
+      JSON.stringify({ id: "task-1", status: "done" }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", dispositionRequest);
+    process.env.PAPERCLIP_API_URL = "http://127.0.0.1:3100";
+    let gatewaySocket!: import("ws").WebSocket;
+    let terminalLogSeen!: () => void;
+    const terminalLogAttempted = new Promise<void>((resolve) => { terminalLogSeen = resolve; });
+    let releaseTerminalLog!: () => void;
+    const terminalLogReleased = new Promise<void>((resolve) => { releaseTerminalLog = resolve; });
+    const testGateway = await gateway((socket) => {
+      gatewaySocket = socket;
+      socket.send(JSON.stringify({ type: "hello", version: 1 }));
+      socket.on("message", (raw) => {
+        const dispatch = JSON.parse(String(raw));
+        socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, accepted: true, duplicate: false, state: "accepted" }));
+        socket.send(JSON.stringify({ type: "run_result", version: 1, runId: dispatch.runId, taskId: dispatch.taskId, agentId: dispatch.agentId, status, result: { code } }));
+      });
+    });
+    try {
+      const resultPromise = execute({
+        ...context(testGateway.port),
+        onLog: async (stream) => {
+          if (stream === "stderr") {
+            terminalLogSeen();
+            await terminalLogReleased;
+          }
+        },
+      });
+      await terminalLogAttempted;
+      gatewaySocket.send(JSON.stringify({
+        type: "run_result",
+        version: 1,
+        runId: "run-1",
+        taskId: "task-1",
+        agentId: "agent-oh",
+        status: "completed",
+        result: completedEvidence(),
+      }));
+      const completionFrameObserved = new Promise<void>((resolve) => gatewaySocket.once("pong", () => resolve()));
+      gatewaySocket.ping();
+      await Promise.race([completionFrameObserved, resultPromise.then(() => undefined)]);
+      expect(dispositionRequest).not.toHaveBeenCalled();
+      releaseTerminalLog();
+      await expect(resultPromise).resolves.toMatchObject({ errorCode });
+    } finally {
+      releaseTerminalLog?.();
+      await testGateway.close();
+    }
+  });
+
   it("rejects a contradictory rejected acknowledgement after acceptance", async () => {
     await setGatewayToken();
     const testGateway = await gateway((socket) => {
@@ -1010,6 +1113,8 @@ describe("OpenHands gateway contract", () => {
     const received: Record<string, unknown>[] = [];
     let dispatchSeen!: () => void;
     const dispatchReceived = new Promise<void>((resolve) => { dispatchSeen = resolve; });
+    let acceptanceSeen!: () => void;
+    const acceptanceLogged = new Promise<void>((resolve) => { acceptanceSeen = resolve; });
     const testGateway = await gateway((socket) => {
       socket.send(JSON.stringify({ type: "hello", version: 1 }));
       socket.on("message", (raw) => {
@@ -1024,13 +1129,72 @@ describe("OpenHands gateway contract", () => {
     });
     try {
       vi.useFakeTimers();
-      const resultPromise = execute(context(testGateway.port));
+      const resultPromise = execute({
+        ...context(testGateway.port),
+        onLog: async (_stream, line) => {
+          if (line === "OpenHands gateway dispatch accepted.\n") acceptanceSeen();
+        },
+      });
       await dispatchReceived;
+      await acceptanceLogged;
       await vi.advanceTimersByTimeAsync(60_000);
       const result = await resultPromise;
       expect(result).toMatchObject({ exitCode: 1, timedOut: true, errorCode: "OPENHANDS_TIMEOUT" });
       expect(received.filter((frame) => frame.type === "cancel")).toEqual([{ type: "cancel", version: 1, runId: "run-1", taskId: "task-1", agentId: "agent-oh" }]);
     } finally { vi.useRealTimers(); await testGateway.close(); }
+  });
+
+  it("never dispositions completion delivered after local deadline cancellation begins", async () => {
+    await setGatewayToken();
+    const dispositionRequest = vi.fn(async () => new Response(
+      JSON.stringify({ id: "task-1", status: "done" }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", dispositionRequest);
+    process.env.PAPERCLIP_API_URL = "http://127.0.0.1:3100";
+    let dispatchSeen!: () => void;
+    const dispatchReceived = new Promise<void>((resolve) => { dispatchSeen = resolve; });
+    let acceptanceSeen!: () => void;
+    const acceptanceLogged = new Promise<void>((resolve) => { acceptanceSeen = resolve; });
+    let completionSent!: () => void;
+    const completionDelivered = new Promise<void>((resolve) => { completionSent = resolve; });
+    const testGateway = await gateway((socket) => {
+      socket.send(JSON.stringify({ type: "hello", version: 1 }));
+      socket.on("message", (raw) => {
+        const incoming = JSON.parse(String(raw)) as Record<string, unknown>;
+        if (incoming.type === "dispatch") {
+          dispatchSeen();
+          socket.send(JSON.stringify({ type: "dispatch_ack", version: 1, runId: incoming.runId, taskId: incoming.taskId, agentId: incoming.agentId, accepted: true, duplicate: false, state: "accepted" }));
+        }
+        if (incoming.type === "cancel") {
+          socket.send(JSON.stringify({ type: "run_result", version: 1, runId: incoming.runId, taskId: incoming.taskId, agentId: incoming.agentId, status: "completed", result: completedEvidence() }));
+          socket.once("pong", completionSent);
+          socket.ping();
+        }
+      });
+    });
+    try {
+      vi.useFakeTimers();
+      const resultPromise = execute({
+        ...context(testGateway.port),
+        onLog: async (_stream, line) => {
+          if (line === "OpenHands gateway dispatch accepted.\n") acceptanceSeen();
+        },
+      });
+      await dispatchReceived;
+      await acceptanceLogged;
+      await vi.advanceTimersByTimeAsync(60_000);
+      await completionDelivered;
+      expect(dispositionRequest).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(resultPromise).resolves.toMatchObject({
+        errorCode: "OPENHANDS_INDETERMINATE",
+        resultJson: { state: "indeterminate", reason: "cancel_unacknowledged" },
+      });
+    } finally {
+      vi.useRealTimers();
+      await testGateway.close();
+    }
   });
 
   it("records an unacknowledged cancellation disconnect as indeterminate", async () => {
