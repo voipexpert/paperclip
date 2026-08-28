@@ -131,6 +131,7 @@ import {
   issueService,
   type ActivityPublication,
   type IssueFilters,
+  type LogActivityInput,
   clampIssueListLimit,
   documentService,
   documentAnnotationService,
@@ -166,6 +167,11 @@ import {
   collectIssueWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
+import {
+  OPENHANDS_DISPOSITION_AUTHORIZATION_REASON,
+  OPENHANDS_DISPOSITION_REJECTION,
+  openHandsDispositionEvidenceSchema,
+} from "../adapters/openhands-gateway/disposition-contract.js";
 import {
   GENERIC_ATTACHMENT_CONTENT_TYPES,
   isInlineAttachmentContentType,
@@ -2789,6 +2795,34 @@ export function issueRoutes(
       agentId: string,
       options: Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1],
     ) => ReturnType<ReturnType<typeof heartbeatService>["wakeup"]>;
+    completionLifecycleHooks?: {
+      syncRoutineRunStatusForIssue?: (issueId: string) => Promise<unknown>;
+      reportRunActivity?: (runId: string) => Promise<unknown>;
+      syncCommentReferences?: (commentId: string) => Promise<unknown>;
+      syncCommentExternalObjects?: (commentId: string) => Promise<unknown>;
+      expireRequestConfirmationsSupersededByComment?: ReturnType<
+        typeof issueThreadInteractionService
+      >["expireRequestConfirmationsSupersededByComment"];
+      expirePendingInteractionsForTerminalIssue?: ReturnType<
+        typeof issueThreadInteractionService
+      >["expirePendingInteractionsForTerminalIssue"];
+      destroyReusableSandboxLeases?: (input: {
+        companyId: string;
+        issueId: string;
+        executionWorkspaceId: string | null;
+        failureReason: string;
+      }) => Promise<unknown>;
+      reconcileTaskWatchdogs?: (
+        companyId: string,
+        issueId: string,
+        options: { runId: string | null },
+      ) => Promise<unknown>;
+      wakeup?: (
+        agentId: string,
+        options: Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1],
+      ) => Promise<unknown>;
+      scheduleDetachedLifecycle?: (effect: () => Promise<void>) => void;
+    };
     issueListDiagnostics?: IssueListDiagnostics;
     approveToolActionRequest?: (input: {
       companyId: string;
@@ -2890,10 +2924,45 @@ export function issueRoutes(
   };
   const feedbackExportService = opts?.feedbackExportService;
   const environmentsSvc = environmentService(db);
+  const completionLifecycleHooks = {
+    syncRoutineRunStatusForIssue:
+      opts.completionLifecycleHooks?.syncRoutineRunStatusForIssue
+      ?? routinesSvc.syncRunStatusForIssue,
+    reportRunActivity:
+      opts.completionLifecycleHooks?.reportRunActivity
+      ?? heartbeat.reportRunActivity,
+    syncCommentReferences:
+      opts.completionLifecycleHooks?.syncCommentReferences
+      ?? issueReferencesSvc.syncComment,
+    syncCommentExternalObjects:
+      opts.completionLifecycleHooks?.syncCommentExternalObjects
+      ?? externalObjectsSvc.syncCommentSafely,
+    expireRequestConfirmationsSupersededByComment:
+      opts.completionLifecycleHooks?.expireRequestConfirmationsSupersededByComment
+      ?? issueThreadInteractionsSvc.expireRequestConfirmationsSupersededByComment,
+    expirePendingInteractionsForTerminalIssue:
+      opts.completionLifecycleHooks?.expirePendingInteractionsForTerminalIssue
+      ?? issueThreadInteractionsSvc.expirePendingInteractionsForTerminalIssue,
+    destroyReusableSandboxLeases:
+      opts.completionLifecycleHooks?.destroyReusableSandboxLeases
+      ?? environmentRuntime.destroyReusableSandboxLeases,
+    reconcileTaskWatchdogs:
+      opts.completionLifecycleHooks?.reconcileTaskWatchdogs
+      ?? ((companyId: string, issueId: string, options: { runId: string | null }) =>
+        taskWatchdogsSvc.reconcileForIssueAndAncestors(companyId, issueId, options)),
+    wakeup:
+      opts.completionLifecycleHooks?.wakeup
+      ?? heartbeat.wakeup,
+    scheduleDetachedLifecycle:
+      opts.completionLifecycleHooks?.scheduleDetachedLifecycle
+      ?? ((effect: () => Promise<void>) => {
+        void effect().catch((err) => logger.warn({ err }, "issue detached lifecycle failed"));
+      }),
+  };
 
   async function queueTaskWatchdogEvaluation(issue: { id: string; companyId: string }, runId?: string | null) {
-    await taskWatchdogsSvc
-      .reconcileForIssueAndAncestors(issue.companyId, issue.id, { runId: runId ?? null })
+    await completionLifecycleHooks
+      .reconcileTaskWatchdogs(issue.companyId, issue.id, { runId: runId ?? null })
       .catch((err) => {
         logger.warn({ err, issueId: issue.id }, "task watchdog evaluation hook failed");
       });
@@ -5633,7 +5702,7 @@ export function issueRoutes(
     executionWorkspaceId?: string | null;
   }) {
     try {
-      await environmentRuntime.destroyReusableSandboxLeases({
+      await completionLifecycleHooks.destroyReusableSandboxLeases({
         companyId: issue.companyId,
         issueId: issue.id,
         executionWorkspaceId: issue.executionWorkspaceId ?? null,
@@ -5645,6 +5714,209 @@ export function issueRoutes(
         "failed to destroy reusable sandbox leases for terminal issue",
       );
     }
+  }
+
+  async function runCompletedIssuePostCommitHook<T>(
+    issueId: string,
+    hook: string,
+    effect: () => Promise<T>,
+  ): Promise<T | null> {
+    try {
+      return await effect();
+    } catch (err) {
+      logger.warn({ err, issueId, hook }, "issue completion post-commit hook failed");
+      return null;
+    }
+  }
+
+  async function runCompletedIssuePostCommitLifecycle(input: {
+    previousIssue: { status: string };
+    issue: {
+      id: string;
+      companyId: string;
+      identifier?: string | null;
+      status: string;
+      parentId?: string | null;
+      executionWorkspaceId?: string | null;
+    };
+    comment: Awaited<ReturnType<typeof svc.addComment>>;
+    actor: ReturnType<typeof getActorInfo>;
+    issueUpdatedActivity: LogActivityInput;
+    commentAddedActivity: LogActivityInput;
+    synchronizeComment: boolean;
+    expireCommentConfirmations: boolean;
+  }) {
+    if (input.previousIssue.status !== "in_progress" || input.issue.status !== "done") return;
+
+    const runIsolated = <T>(hook: string, effect: () => Promise<T>) =>
+      runCompletedIssuePostCommitHook(input.issue.id, hook, effect);
+
+    await runIsolated("routine_sync", () =>
+      completionLifecycleHooks.syncRoutineRunStatusForIssue(input.issue.id));
+    if (input.actor.runId) {
+      await runIsolated("run_activity", () =>
+        completionLifecycleHooks.reportRunActivity(input.actor.runId!));
+    }
+    if (input.synchronizeComment) {
+      await runIsolated("comment_reference_sync", () =>
+        completionLifecycleHooks.syncCommentReferences(input.comment.id));
+      await runIsolated("comment_external_object_sync", () =>
+        completionLifecycleHooks.syncCommentExternalObjects(input.comment.id));
+    }
+    if (input.expireCommentConfirmations) {
+      await runIsolated("comment_confirmation_expiry", async () => {
+        const expiredInteractions = await completionLifecycleHooks
+          .expireRequestConfirmationsSupersededByComment(
+          input.issue,
+          input.comment,
+          {
+            agentId: input.actor.agentId,
+            userId: input.actor.actorType === "user" ? input.actor.actorId : null,
+          },
+        );
+        await logExpiredRequestConfirmations({
+          issue: input.issue,
+          interactions: expiredInteractions,
+          actor: input.actor,
+          source: "issue.comment",
+        });
+      });
+    }
+    await runIsolated("issue_activity", () => logActivity(db, input.issueUpdatedActivity));
+    await runIsolated("comment_activity", () => logActivity(db, input.commentAddedActivity));
+
+    completionLifecycleHooks.scheduleDetachedLifecycle(async () => {
+      const dependents = await runIsolated(
+        "dependent_lookup",
+        () => svc.listWakeableBlockedDependents(input.issue.id),
+      ) ?? [];
+      for (const dependent of dependents) {
+        const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
+          dependentIssueId: dependent.id,
+          blockerIssueIds: dependent.blockerIssueIds,
+        });
+        const existingWake = await runIsolated("dependent_wake_dedup", () =>
+          findExistingIssueBlockersResolvedWakeForReadyState(db, {
+            companyId: input.issue.companyId,
+            dependentIssueId: dependent.id,
+            blockerIssueIds: dependent.blockerIssueIds,
+          }));
+        if (existingWake) continue;
+        const wakeRun = await runIsolated("dependent_wake", () => completionLifecycleHooks.wakeup(
+          dependent.assigneeAgentId,
+          {
+            source: "automation",
+            triggerDetail: "system",
+            reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+            payload: {
+              issueId: dependent.id,
+              resolvedBlockerIssueId: input.issue.id,
+              blockerIssueIds: dependent.blockerIssueIds,
+              mutation: "blocker_done",
+            },
+            idempotencyKey,
+            requestedByActorType: input.actor.actorType,
+            requestedByActorId: input.actor.actorId,
+            contextSnapshot: {
+              issueId: dependent.id,
+              taskId: dependent.id,
+              wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+              source: "issue.blockers_resolved",
+              resolvedBlockerIssueId: input.issue.id,
+              blockerIssueIds: dependent.blockerIssueIds,
+            },
+          },
+        ));
+        const wakeRunId = wakeRun && typeof wakeRun === "object" && "id" in wakeRun
+          && typeof wakeRun.id === "string"
+          ? wakeRun.id
+          : null;
+        if (wakeRunId) {
+          await runIsolated("dependent_wake_activity", () => logActivity(db, {
+            companyId: input.issue.companyId,
+            actorType: "system",
+            actorId: "issue_update",
+            agentId: dependent.assigneeAgentId,
+            runId: input.actor.runId,
+            agentApiKeyId: input.actor.agentApiKeyId,
+            action: "issue.blockers_resolved_wake_emitted",
+            entityType: "issue",
+            entityId: dependent.id,
+            details: {
+              source: "issue.blockers_resolved",
+              wakeupRunId: wakeRunId,
+              idempotencyKey,
+              resolvedBlockerIssueId: input.issue.id,
+              blockerIssueIds: dependent.blockerIssueIds,
+            },
+          }));
+        }
+      }
+
+      await runIsolated("terminal_interaction_expiry", async () => {
+        const expiredInteractions = await completionLifecycleHooks
+          .expirePendingInteractionsForTerminalIssue(input.issue, {
+            agentId: input.actor.agentId,
+            userId: input.actor.actorType === "user" ? input.actor.actorId : null,
+          });
+        await logExpiredRequestConfirmations({
+          issue: input.issue,
+          interactions: expiredInteractions,
+          actor: input.actor,
+          source: "issue.status_transition.issue_closed",
+        });
+      });
+      await runIsolated("reusable_lease_cleanup", () =>
+        completionLifecycleHooks.destroyReusableSandboxLeases({
+          companyId: input.issue.companyId,
+          issueId: input.issue.id,
+          executionWorkspaceId: input.issue.executionWorkspaceId ?? null,
+          failureReason: "issue_terminal_done",
+        }));
+
+      if (input.issue.parentId) {
+        const parent = await runIsolated(
+          "parent_lookup",
+          () => svc.getWakeableParentAfterChildCompletion(input.issue.parentId!),
+        );
+        if (parent) {
+          await runIsolated("parent_wake", () => completionLifecycleHooks.wakeup(
+            parent.assigneeAgentId,
+            {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_children_completed",
+              idempotencyKey: `issue_children_completed:${parent.id}:${input.issue.id}`,
+              payload: {
+                issueId: parent.id,
+                completedChildIssueId: input.issue.id,
+                childIssueIds: parent.childIssueIds,
+                childIssueSummaries: parent.childIssueSummaries,
+                childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+              },
+              requestedByActorType: input.actor.actorType,
+              requestedByActorId: input.actor.actorId,
+              contextSnapshot: {
+                issueId: parent.id,
+                taskId: parent.id,
+                wakeReason: "issue_children_completed",
+                source: "issue.children_completed",
+                completedChildIssueId: input.issue.id,
+                childIssueIds: parent.childIssueIds,
+                childIssueSummaries: parent.childIssueSummaries,
+                childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+              },
+            },
+          ));
+        }
+      }
+    });
+
+    await runIsolated("task_watchdog", () => completionLifecycleHooks.reconcileTaskWatchdogs(
+      input.issue.companyId,
+      input.issue.id,
+      { runId: input.actor.runId ?? null },
+    ));
   }
 
   async function resolveIssueRouteId(rawId: string): Promise<string> {
@@ -9357,6 +9629,93 @@ export function issueRoutes(
     },
   );
 
+  router.post(
+    "/issues/:id/openhands-disposition",
+    validate(openHandsDispositionEvidenceSchema),
+    async (req, res) => {
+      if (
+        req.actor.type !== "agent"
+        || req.actor.source !== "agent_jwt"
+        || !req.actor.agentId
+        || !req.actor.companyId
+        || !req.actor.runId
+      ) {
+        res.status(403).json({ error: OPENHANDS_DISPOSITION_REJECTION });
+        return;
+      }
+
+      const result = await svc.finalizeOpenHandsDisposition({
+        issueId: req.params.id as string,
+        companyId: req.actor.companyId,
+        agentId: req.actor.agentId,
+        runId: req.actor.runId,
+        onBehalfOfUserId: req.actor.onBehalfOfUserId,
+        evidence: req.body,
+      });
+      if (!result.replayed) {
+        const actor = getActorInfo(req);
+        const changes = result.issue.changes ?? {};
+        const previous = Object.fromEntries(
+          Object.entries(changes).map(([key, change]) => [key, change.from]),
+        );
+        await runCompletedIssuePostCommitLifecycle({
+          previousIssue: { status: "in_progress" },
+          issue: result.issue,
+          comment: result.comment,
+          actor,
+          synchronizeComment: true,
+          expireCommentConfirmations: true,
+          issueUpdatedActivity: {
+            companyId: result.issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+            action: "issue.updated",
+            entityType: "issue",
+            entityId: result.issue.id,
+            details: {
+              status: "done",
+              identifier: result.issue.identifier,
+              authorizationReason: OPENHANDS_DISPOSITION_AUTHORIZATION_REASON,
+              changes,
+              source: "comment",
+              _previous: Object.keys(changes).length > 0 ? previous : undefined,
+            },
+          },
+          commentAddedActivity: {
+            companyId: result.issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+            action: "issue.comment_added",
+            entityType: "issue",
+            entityId: result.issue.id,
+            details: {
+              commentId: result.comment.id,
+              bodySnippet: result.comment.body.slice(0, 120),
+              identifier: result.issue.identifier,
+              issueTitle: result.issue.title,
+              authorizationReason: OPENHANDS_DISPOSITION_AUTHORIZATION_REASON,
+              updated: Object.keys(changes).length > 0,
+            },
+          },
+        });
+      }
+      res.json({
+        id: result.issue.id,
+        status: result.issue.status,
+        replayed: result.replayed,
+        commentId: result.comment.id,
+      });
+    },
+  );
+
   router.patch("/issues/:id", validateIssueMutationBody(updateIssueRouteSchema), async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
@@ -10101,10 +10460,20 @@ export function issueRoutes(
         blocks: updatedRelations.blocks,
       };
     }
-    await routinesSvc.syncRunStatusForIssue(issue.id);
+    const usesCompletedIssuePostCommitLifecycle =
+      existing.status === "in_progress"
+      && issue.status === "done"
+      && Boolean(commentBody);
+    const runCommentLifecyclePhase = <T>(hook: string, effect: () => Promise<T>) =>
+      usesCompletedIssuePostCommitLifecycle
+        ? runCompletedIssuePostCommitHook(issue.id, hook, effect)
+        : effect();
+    if (!usesCompletedIssuePostCommitLifecycle) {
+      await completionLifecycleHooks.syncRoutineRunStatusForIssue(issue.id);
+    }
 
-    if (actor.runId) {
-      await heartbeat.reportRunActivity(actor.runId).catch((err) =>
+    if (actor.runId && !usesCompletedIssuePostCommitLifecycle) {
+      await completionLifecycleHooks.reportRunActivity(actor.runId).catch((err) =>
         logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue activity"));
     }
 
@@ -10167,7 +10536,7 @@ export function issueRoutes(
         activeRecoveryAction: null,
       };
     }
-    if (!persistReviewActivityTransactionally) await logActivity(db, {
+    const issueUpdatedActivity: LogActivityInput = {
       companyId: issue.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
@@ -10208,7 +10577,10 @@ export function issueRoutes(
             : null,
         ),
       },
-    });
+    };
+    if (!persistReviewActivityTransactionally && !usesCompletedIssuePostCommitLifecycle) {
+      await logActivity(db, issueUpdatedActivity);
+    }
 
     if (existing.status === "in_progress" && issue.status !== existing.status && issue.status !== "in_progress") {
       await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id], { hydrateLiveness: false })
@@ -10410,7 +10782,8 @@ export function issueRoutes(
       }
     }
 
-    let comment = null;
+    let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
+    let commentAddedActivity: LogActivityInput | null = null;
     let lostReviewPathRef: string | null = null;
     if (commentBody) {
       const commentReferenceSummaryBefore = updateReferenceSummaryAfter
@@ -10424,8 +10797,10 @@ export function issueRoutes(
         authorizationReason: issueMutationAuthorizationReason,
         sourceTrust: await sourceTrustForActorWrite(issue, actor),
       });
-      await issueReferencesSvc.syncComment(comment.id);
-      await externalObjectsSvc.syncCommentSafely(comment.id);
+      await runCommentLifecyclePhase("comment_reference_sync", () =>
+        completionLifecycleHooks.syncCommentReferences(comment.id));
+      await runCommentLifecyclePhase("comment_external_object_sync", () =>
+        completionLifecycleHooks.syncCommentExternalObjects(comment.id));
       const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
         commentReferenceSummaryBefore,
@@ -10439,7 +10814,7 @@ export function issueRoutes(
         ),
       };
 
-      await logActivity(db, {
+      commentAddedActivity = {
         companyId: issue.companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,
@@ -10473,22 +10848,28 @@ export function issueRoutes(
             currentReferencedIssues: commentReferenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
           }),
         },
-      });
+      };
+      if (!usesCompletedIssuePostCommitLifecycle) {
+        await logActivity(db, commentAddedActivity);
+      }
 
-      const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
-        issue,
-        comment,
-        {
-          agentId: actor.agentId,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-        },
-      );
-      await logExpiredRequestConfirmations({
-        issue,
-        interactions: expiredInteractions,
-        actor,
-        source: "issue.comment",
-      });
+      const expiredInteractions = await runCommentLifecyclePhase("comment_confirmation_expiry", async () => {
+        const interactions = await completionLifecycleHooks.expireRequestConfirmationsSupersededByComment(
+          issue,
+          comment,
+          {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        );
+        await logExpiredRequestConfirmations({
+          issue,
+          interactions,
+          actor,
+          source: "issue.comment",
+        });
+        return interactions;
+      }) ?? [];
       if (issue.status === "in_review" && expiredInteractions.length > 0) {
         const reviewAttention = await svc
           .listReviewAttention(issue.companyId, [issue])
@@ -10509,6 +10890,19 @@ export function issueRoutes(
           (item) => item.issue.identifier ?? item.issue.id,
         ),
       };
+    }
+
+    if (usesCompletedIssuePostCommitLifecycle && comment && commentAddedActivity) {
+      await runCompletedIssuePostCommitLifecycle({
+        previousIssue: existing,
+        issue,
+        comment,
+        actor,
+        issueUpdatedActivity,
+        commentAddedActivity,
+        synchronizeComment: false,
+        expireCommentConfirmations: false,
+      });
     }
 
     const assigneeChanged =
@@ -10538,7 +10932,7 @@ export function issueRoutes(
     });
 
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
-    void (async () => {
+    completionLifecycleHooks.scheduleDetachedLifecycle(async () => {
       type WakeupRequest = NonNullable<Parameters<typeof heartbeat.wakeup>[1]>;
       type DependencyReadinessProvider = {
         getDependencyReadiness?: typeof svc.getDependencyReadiness;
@@ -10745,7 +11139,7 @@ export function issueRoutes(
       }
 
       const becameDone = existing.status !== "done" && issue.status === "done";
-      if (becameDone) {
+      if (becameDone && !usesCompletedIssuePostCommitLifecycle) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
           await addDependencyResolvedWakeup({
@@ -10834,8 +11228,8 @@ export function issueRoutes(
 
       const becameTerminal =
         !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
-      if (becameTerminal) {
-        const expiredInteractions = await issueThreadInteractionService(db).expirePendingInteractionsForTerminalIssue(issue, {
+      if (becameTerminal && !usesCompletedIssuePostCommitLifecycle) {
+        const expiredInteractions = await completionLifecycleHooks.expirePendingInteractionsForTerminalIssue(issue, {
           agentId: actor.agentId,
           userId: actor.actorType === "user" ? actor.actorId : null,
         });
@@ -10847,7 +11241,7 @@ export function issueRoutes(
         });
         await destroyReusableSandboxLeasesForTerminalIssue(issue);
       }
-      if (becameTerminal && issue.parentId) {
+      if (becameTerminal && issue.parentId && !usesCompletedIssuePostCommitLifecycle) {
         const parent = await svc.getWakeableParentAfterChildCompletion(issue.parentId);
         if (parent) {
           addWakeup(parent.assigneeAgentId, {
@@ -10878,12 +11272,16 @@ export function issueRoutes(
       }
 
       for (const { agentId, wakeup } of wakeups.values()) {
-        heartbeat
+        completionLifecycleHooks
           .wakeup(agentId, wakeup)
           .then((wakeRun) => {
             if (wakeup.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) return;
             const payload = wakeup.payload && typeof wakeup.payload === "object" ? wakeup.payload : {};
             const dependentIssueId = typeof payload.issueId === "string" ? payload.issueId : issue.id;
+            const wakeupRunId = wakeRun && typeof wakeRun === "object" && "id" in wakeRun
+              && typeof wakeRun.id === "string"
+              ? wakeRun.id
+              : null;
             return logActivity(db, {
               companyId: issue.companyId,
               actorType: "system",
@@ -10896,7 +11294,7 @@ export function issueRoutes(
               entityId: dependentIssueId,
               details: {
                 source: wakeup.contextSnapshot?.source ?? "issue.update",
-                wakeupRunId: wakeRun?.id ?? null,
+                wakeupRunId,
                 idempotencyKey: wakeup.idempotencyKey ?? null,
                 resolvedBlockerIssueId: typeof payload.resolvedBlockerIssueId === "string"
                   ? payload.resolvedBlockerIssueId
@@ -10907,9 +11305,11 @@ export function issueRoutes(
           })
           .catch((err) => logger.warn({ err, issueId: issue.id, agentId }, "failed to wake agent on issue update"));
       }
-    })();
+    });
 
-    await queueTaskWatchdogEvaluation(issue, actor.runId);
+    if (!usesCompletedIssuePostCommitLifecycle) {
+      await queueTaskWatchdogEvaluation(issue, actor.runId);
+    }
     const changes = issueResponse.changes ?? {};
     if (prefersMinimalIssueUpdateResponse(req)) {
       res.setHeader("Preference-Applied", "return=minimal");

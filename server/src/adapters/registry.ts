@@ -485,7 +485,7 @@ const openhandsGatewayAdapter: ServerAdapterModule = {
   execute: openhandsGatewayExecute,
   testEnvironment: openhandsGatewayTestEnvironment,
   models: openhandsGatewayModels,
-  supportsLocalAgentJwt: false,
+  supportsLocalAgentJwt: true,
   supportsInstructionsBundle: false,
   requiresMaterializedRuntimeSkills: false,
   agentConfigurationDoc: openhandsGatewayAgentConfigurationDoc,

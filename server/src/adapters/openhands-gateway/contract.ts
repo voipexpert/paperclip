@@ -1,5 +1,6 @@
 import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { isOpenHandsBaseRef, isOpenHandsRepository } from "./disposition-contract.js";
 
 export type Target = { repository: string; baseRef: string; profile: "openhands" };
 export type OpenHandsConfig = {
@@ -142,7 +143,7 @@ export function parseOpenHandsConfig(value: AdapterExecutionContext | Record<str
   for (const [projectId, rawTarget] of Object.entries(rawTargets)) {
     const target = record(rawTarget);
     if (!boundedIdentifier(projectId) || !target || !hasOnlyKeys(target, ["repository", "baseRef", "profile"])
-      || !boundedIdentifier(target.repository) || !boundedIdentifier(target.baseRef) || target.profile !== "openhands") {
+      || !isOpenHandsRepository(target.repository) || !isOpenHandsBaseRef(target.baseRef) || target.profile !== "openhands") {
       return new ContractError("OPENHANDS_CONFIG");
     }
     projectTargets[projectId] = { repository: target.repository, baseRef: target.baseRef, profile: "openhands" };

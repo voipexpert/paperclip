@@ -131,6 +131,12 @@ import {
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import {
+  buildOpenHandsDispositionComment,
+  OPENHANDS_DISPOSITION_AUTHORIZATION_REASON,
+  OPENHANDS_DISPOSITION_REJECTION,
+  type OpenHandsDispositionEvidence,
+} from "../adapters/openhands-gateway/disposition-contract.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -7631,6 +7637,80 @@ export function issueService(db: Db) {
       });
     },
 
+    finalizeOpenHandsDisposition: async (input: {
+      issueId: string;
+      companyId: string;
+      agentId: string;
+      runId: string;
+      onBehalfOfUserId?: string | null;
+      evidence: OpenHandsDispositionEvidence;
+    }) => {
+      const commentBody = buildOpenHandsDispositionComment(input.evidence);
+      const rejectDisposition = (): never => {
+        throw conflict(OPENHANDS_DISPOSITION_REJECTION);
+      };
+
+      return db.transaction(async (tx) => {
+        const issue = await tx
+          .select()
+          .from(issues)
+          .where(eq(issues.id, input.issueId))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!issue || issue.companyId !== input.companyId) rejectDisposition();
+
+        const receipt = await tx
+          .select()
+          .from(issueComments)
+          .where(and(
+            eq(issueComments.companyId, input.companyId),
+            eq(issueComments.issueId, input.issueId),
+            eq(issueComments.authorAgentId, input.agentId),
+            eq(issueComments.createdByRunId, input.runId),
+            eq(issueComments.body, commentBody),
+            isNull(issueComments.deletedAt),
+            sql`${issueComments.metadata} ->> 'authorizationReason' = ${OPENHANDS_DISPOSITION_AUTHORIZATION_REASON}`,
+          ))
+          .then((rows) => rows[0] ?? null);
+
+        if (receipt) {
+          if (issue.status !== "done" || issue.assigneeAgentId !== input.agentId) rejectDisposition();
+          return { issue, comment: receipt, replayed: true } as const;
+        }
+
+        if (
+          issue.status !== "in_progress"
+          || issue.assigneeAgentId !== input.agentId
+          || issue.checkoutRunId !== input.runId
+          || issue.executionRunId !== input.runId
+          || !issue.executionLockedAt
+        ) rejectDisposition();
+
+        const transactionalService = issueService(db);
+        const updated = await transactionalService.update(
+          input.issueId,
+          { status: "done", actorAgentId: input.agentId },
+          tx,
+        );
+        if (!updated) return rejectDisposition();
+        const comment = await transactionalService.addComment(
+          input.issueId,
+          commentBody,
+          {
+            agentId: input.agentId,
+            runId: input.runId,
+            onBehalfOfUserId: input.onBehalfOfUserId,
+          },
+          {
+            authorizationReason: OPENHANDS_DISPOSITION_AUTHORIZATION_REASON,
+            redactCurrentUser: false,
+          },
+          tx,
+        );
+        return { issue: updated, comment, replayed: false } as const;
+      });
+    },
+
     update: async (
       id: string,
       data: Partial<typeof issues.$inferInsert> & {
@@ -8802,6 +8882,7 @@ export function issueService(db: Db) {
         presentation?: IssueCommentPresentation | null;
         metadata?: IssueCommentMetadata | null;
         authorizationReason?: string | null;
+        redactCurrentUser?: boolean;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
       },
@@ -8818,7 +8899,9 @@ export function issueService(db: Db) {
       const currentUserRedactionOptions = {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
       };
-      const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
+      const redactedBody = options?.redactCurrentUser === false
+        ? body
+        : redactCurrentUserText(body, currentUserRedactionOptions);
       const authorType = issueCommentAuthorTypeSchema.parse(
         options?.authorType ?? (actor.agentId ? "agent" : actor.userId ? "user" : "system"),
       );

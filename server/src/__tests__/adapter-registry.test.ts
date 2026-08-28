@@ -257,6 +257,13 @@ describe("server adapter registry", () => {
     expect(adapter!.supportsLocalAgentJwt).toBe(true);
   });
 
+  it("mints server-only local-agent JWTs for the built-in OpenHands gateway adapter", () => {
+    const adapter = findActiveServerAdapter("openhands_gateway");
+
+    expect(adapter).not.toBeNull();
+    expect(adapter!.supportsLocalAgentJwt).toBe(true);
+  });
+
   it("built-in local adapters declare cheap model profile defaults where supported", async () => {
     await expect(listAdapterModelProfiles("claude_local")).resolves.toEqual([
       expect.objectContaining({
