@@ -111,6 +111,25 @@
 - [ ] Write `.superpowers/sdd/2026-08-28-openhands-disposition-finalization/final-fix-report.md` with files/architecture, RED evidence per finding, GREEN commands/counts, integration coverage, migrations, commits, and self-review.
 - [ ] Commit the complete fix wave locally. Do not push or open a PR.
 
+## Task 8: Follow-up terminal settlement and completion lifecycle
+
+**Files:**
+
+- Modify `server/src/adapters/openhands-gateway/execute.test.ts`
+- Modify `server/src/adapters/openhands-gateway/execute.ts`
+- Modify `server/src/__tests__/openhands-disposition-route.test.ts`
+- Modify `server/src/routes/issues.ts`
+- Modify this plan and the design document
+
+- [x] RED: make terminal `onLog` reject for rejected acknowledgement, failure, cancellation, and timeout; observe all four adapter promises remain unsettled until the outer deterministic test timeout.
+- [x] GREEN: route every terminal log through a best-effort boundary after the common terminal latch, preserving the fixed selected result and zero-disposition rule.
+- [x] Map the applicable generic PATCH completion hooks and exclude assignee-comment wakes, mentions, blocked/restoration wakes, and stop relays from dedicated server-constructed evidence.
+- [x] RED: prove the dedicated route commits successfully but runs none of the mapped lifecycle hooks, and prove a throwing post-commit hook has no isolation contract.
+- [x] GREEN: extract the smallest shared post-commit orchestrator, invoke it after first disposition commit, and reuse it for the exact generic PATCH `in_progress` to `done` transition with a comment.
+- [x] Make hook failures independent and non-transactional; use stable dependency-ready-state and parent-completion wake keys.
+- [x] On exact receipt replay, return the existing receipt and skip all lifecycle effects so response-loss retries cannot duplicate mutation.
+- [x] Run the focused adapter, route, lifecycle, recovery, server typecheck/build, and diff checks; record all evidence in `followup-fix-report.md`.
+
 ## Acceptance checklist
 
 - [ ] Every final-review finding maps to a focused test or an explicitly documented no-production-change coverage addition.

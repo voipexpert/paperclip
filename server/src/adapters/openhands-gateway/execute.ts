@@ -195,6 +195,9 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
       if (socket.readyState !== WebSocket.CLOSED) { try { socket.terminate(); } catch { socket.close(); } }
       resolve(value);
     };
+    const logTerminalBestEffort = async (stream: "stdout" | "stderr", line: string) => {
+      try { await context.onLog(stream, line); } catch { /* terminal result is already selected */ }
+    };
     const indeterminate = (reason = "post_dispatch_disconnect") => finish({
       ...result("OPENHANDS_INDETERMINATE"),
       clearSession: false,
@@ -244,7 +247,7 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
         if (incoming.accepted === false) {
           terminalStarted = true;
           clearTimeout(deadlineTimer);
-          await context.onLog("stderr", "OpenHands gateway dispatch rejected.\n");
+          await logTerminalBestEffort("stderr", "OpenHands gateway dispatch rejected.\n");
           finish(result(incoming.reason === "busy" ? "OPENHANDS_BUSY" : "OPENHANDS_REJECTED"));
           return;
         }
@@ -281,13 +284,12 @@ export async function execute(context: AdapterExecutionContext, credentialSecuri
           return;
         }
         const completed = { exitCode: 0, signal: null, timedOut: false, resultJson: frame(incoming.result)! };
-        try { await context.onLog("stdout", "OpenHands gateway completed.\n"); }
-        catch { finish(completed); return; }
+        await logTerminalBestEffort("stdout", "OpenHands gateway completed.\n");
         finish(completed);
       } else {
         if (incoming.status === "indeterminate") { indeterminate("gateway_indeterminate"); return; }
         const code = incoming.status === "failed" ? "OPENHANDS_FAILED" : incoming.status === "cancelled" ? "OPENHANDS_CANCELLED" : "OPENHANDS_TIMEOUT";
-        await context.onLog("stderr", `OpenHands gateway ${incoming.status}.\n`);
+        await logTerminalBestEffort("stderr", `OpenHands gateway ${incoming.status}.\n`);
         finish({ ...result(code, incoming.status === "timed_out"), resultJson: { state: incoming.status, reason: (incoming.result as { code: string }).code } });
       }
     });

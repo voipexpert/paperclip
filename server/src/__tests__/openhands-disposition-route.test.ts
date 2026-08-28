@@ -1,15 +1,19 @@
 import { randomUUID } from "node:crypto";
 import { userInfo } from "node:os";
 import express from "express";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   heartbeatRuns,
   issueComments,
+  issueRelations,
   issues,
+  routineRuns,
+  routines,
 } from "@paperclipai/db";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { actorMiddleware } from "../middleware/auth.js";
@@ -17,6 +21,7 @@ import { errorHandler } from "../middleware/error-handler.js";
 import { issueRoutes } from "../routes/issues.js";
 import { decideSuccessfulRunHandoff } from "../services/recovery/successful-run-handoff.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { routineService } from "../services/routines.js";
 import {
   describeEmbeddedPostgres,
   useEmbeddedPostgres,
@@ -52,7 +57,7 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
     else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalJwtSecret;
   });
 
-  function app() {
+  function app(completionLifecycleHooks?: Record<string, unknown>) {
     const instance = express();
     instance.use(express.json());
     instance.use(actorMiddleware(postgres.db, {
@@ -61,7 +66,8 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
     }));
     instance.use("/api", issueRoutes(postgres.db, {} as never, {
       taskWatchdogEnqueueWakeup: null,
-    }));
+      completionLifecycleHooks,
+    } as never));
     instance.use(errorHandler);
     return instance;
   }
@@ -126,6 +132,175 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
       budgetBlocked: false,
       idempotentWakeExists: false,
     })).toEqual({ kind: "skip", reason: "issue status done is a valid disposition" });
+  });
+
+  it("runs the normal completion lifecycle once and skips every effect on receipt replay", async () => {
+    const fixture = await seedFixture(postgres.db, { lifecycle: true });
+    const syncRoutineRunStatusForIssue = vi.fn(async (issueId: string) =>
+      routineService(postgres.db).syncRunStatusForIssue(issueId));
+    const reportRunActivity = vi.fn(async () => undefined);
+    const destroyReusableSandboxLeases = vi.fn(async () => []);
+    const reconcileTaskWatchdogs = vi.fn(async () => undefined);
+    const wakeup = vi.fn(async () => null);
+    const lifecycleHooks = {
+      syncRoutineRunStatusForIssue,
+      reportRunActivity,
+      destroyReusableSandboxLeases,
+      reconcileTaskWatchdogs,
+      wakeup,
+    };
+
+    const first = await request(app(lifecycleHooks))
+      .post(`/api/issues/${fixture.issueId}/openhands-disposition`)
+      .set("Authorization", `Bearer ${fixture.token}`)
+      .send(evidence);
+
+    expect(first.status).toBe(200);
+    expect(first.body.replayed).toBe(false);
+    expect(syncRoutineRunStatusForIssue).toHaveBeenCalledOnce();
+    expect(syncRoutineRunStatusForIssue).toHaveBeenCalledWith(fixture.issueId);
+    expect(reportRunActivity).toHaveBeenCalledOnce();
+    expect(reportRunActivity).toHaveBeenCalledWith(fixture.runId);
+    await vi.waitFor(() => {
+      expect(destroyReusableSandboxLeases).toHaveBeenCalledOnce();
+      expect(wakeup).toHaveBeenCalledTimes(2);
+    });
+    expect(destroyReusableSandboxLeases).toHaveBeenCalledWith({
+      companyId: fixture.companyId,
+      issueId: fixture.issueId,
+      executionWorkspaceId: null,
+      failureReason: "issue_terminal_done",
+    });
+    expect(reconcileTaskWatchdogs).toHaveBeenCalledOnce();
+    expect(reconcileTaskWatchdogs).toHaveBeenCalledWith(
+      fixture.companyId,
+      fixture.issueId,
+      { runId: fixture.runId },
+    );
+    expect(wakeup).toHaveBeenCalledWith(
+      fixture.otherAgentId,
+      expect.objectContaining({
+        reason: "issue_blockers_resolved",
+        idempotencyKey: expect.stringMatching(/^issue_blockers_resolved:state:/),
+        payload: expect.objectContaining({
+          issueId: fixture.dependentIssueId,
+          resolvedBlockerIssueId: fixture.issueId,
+        }),
+      }),
+    );
+    expect(wakeup).toHaveBeenCalledWith(
+      fixture.otherAgentId,
+      expect.objectContaining({
+        reason: "issue_children_completed",
+        idempotencyKey: `issue_children_completed:${fixture.parentIssueId}:${fixture.issueId}`,
+        payload: expect.objectContaining({
+          issueId: fixture.parentIssueId,
+          completedChildIssueId: fixture.issueId,
+        }),
+      }),
+    );
+
+    const [routineRun] = await postgres.db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.id, fixture.routineRunId!));
+    expect(routineRun).toMatchObject({ status: "completed", failureReason: null });
+    expect(routineRun?.completedAt).toBeInstanceOf(Date);
+    const lifecycleActivities = await postgres.db
+      .select()
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, fixture.issueId),
+        inArray(activityLog.action, ["issue.updated", "issue.comment_added"]),
+      ));
+    expect(lifecycleActivities).toHaveLength(2);
+    expect(lifecycleActivities).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        action: "issue.updated",
+        actorType: "agent",
+        actorId: fixture.agentId,
+        agentId: fixture.agentId,
+        runId: fixture.runId,
+        details: expect.objectContaining({
+          authorizationReason: "openhands_transactional_disposition",
+          changes: expect.objectContaining({ status: { from: "in_progress", to: "done" } }),
+        }),
+      }),
+      expect.objectContaining({
+        action: "issue.comment_added",
+        actorType: "agent",
+        actorId: fixture.agentId,
+        agentId: fixture.agentId,
+        runId: fixture.runId,
+        details: expect.objectContaining({
+          commentId: first.body.commentId,
+          authorizationReason: "openhands_transactional_disposition",
+        }),
+      }),
+    ]));
+
+    const replay = await request(app(lifecycleHooks))
+      .post(`/api/issues/${fixture.issueId}/openhands-disposition`)
+      .set("Authorization", `Bearer ${fixture.token}`)
+      .send(evidence);
+
+    expect(replay.status).toBe(200);
+    expect(replay.body.replayed).toBe(true);
+    expect(syncRoutineRunStatusForIssue).toHaveBeenCalledTimes(1);
+    expect(reportRunActivity).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(destroyReusableSandboxLeases).toHaveBeenCalledTimes(1));
+    expect(reconcileTaskWatchdogs).toHaveBeenCalledTimes(1);
+    expect(wakeup).toHaveBeenCalledTimes(2);
+    const replayActivities = await postgres.db
+      .select()
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, fixture.issueId),
+        inArray(activityLog.action, ["issue.updated", "issue.comment_added"]),
+      ));
+    expect(replayActivities).toHaveLength(2);
+  });
+
+  it("isolates a post-commit hook failure and never retries lifecycle mutation on receipt replay", async () => {
+    const fixture = await seedFixture(postgres.db);
+    const hookFailureDetail = "private routine hook failure";
+    const syncRoutineRunStatusForIssue = vi.fn(async () => {
+      throw new Error(hookFailureDetail);
+    });
+    const reportRunActivity = vi.fn(async () => undefined);
+    const destroyReusableSandboxLeases = vi.fn(async () => []);
+    const reconcileTaskWatchdogs = vi.fn(async () => undefined);
+    const lifecycleHooks = {
+      syncRoutineRunStatusForIssue,
+      reportRunActivity,
+      destroyReusableSandboxLeases,
+      reconcileTaskWatchdogs,
+      wakeup: vi.fn(async () => null),
+    };
+
+    const first = await request(app(lifecycleHooks))
+      .post(`/api/issues/${fixture.issueId}/openhands-disposition`)
+      .set("Authorization", `Bearer ${fixture.token}`)
+      .send(evidence);
+    const replay = await request(app(lifecycleHooks))
+      .post(`/api/issues/${fixture.issueId}/openhands-disposition`)
+      .set("Authorization", `Bearer ${fixture.token}`)
+      .send(evidence);
+
+    expect(first.status).toBe(200);
+    expect(first.body.replayed).toBe(false);
+    expect(JSON.stringify(first.body)).not.toContain(hookFailureDetail);
+    expect(replay.status).toBe(200);
+    expect(replay.body.replayed).toBe(true);
+    expect(syncRoutineRunStatusForIssue).toHaveBeenCalledTimes(1);
+    expect(reportRunActivity).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(destroyReusableSandboxLeases).toHaveBeenCalledTimes(1));
+    expect(reconcileTaskWatchdogs).toHaveBeenCalledTimes(1);
+    const comments = await postgres.db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, fixture.issueId));
+    expect(comments).toHaveLength(1);
   });
 
   it("serializes concurrent same-run retries to one receipt comment", async () => {
@@ -249,6 +424,7 @@ async function seedFixture(
       executionLockedAt?: null;
     };
     actor?: { agent?: "other"; run?: "other" | "other-agent" };
+    lifecycle?: boolean;
   } = {},
 ) {
   const companyId = randomUUID();
@@ -258,6 +434,10 @@ async function seedFixture(
   const otherRunId = randomUUID();
   const otherAgentRunId = randomUUID();
   const issueId = randomUUID();
+  const parentIssueId = randomUUID();
+  const dependentIssueId = randomUUID();
+  const routineId = randomUUID();
+  const routineRunId = randomUUID();
   await db.insert(companies).values({
     id: companyId,
     name: "OpenHands disposition test",
@@ -293,6 +473,42 @@ async function seedFixture(
     { id: otherRunId, companyId, agentId, status: "running", contextSnapshot: { issueId } },
     { id: otherAgentRunId, companyId, agentId: otherAgentId, status: "running", contextSnapshot: { issueId } },
   ]);
+  if (mutation.lifecycle) {
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "OpenHands lifecycle routine",
+      assigneeAgentId: agentId,
+      priority: "medium",
+      status: "active",
+      concurrencyPolicy: "coalesce_if_active",
+      catchUpPolicy: "skip_missed",
+    });
+    await db.insert(routineRuns).values({
+      id: routineRunId,
+      companyId,
+      routineId,
+      source: "manual",
+      status: "issue_created",
+      triggeredAt: new Date("2026-08-28T00:00:00.000Z"),
+    });
+    await db.insert(issues).values([
+      {
+        id: parentIssueId,
+        companyId,
+        title: "Parent awaiting OpenHands child",
+        status: "in_progress",
+        assigneeAgentId: otherAgentId,
+      },
+      {
+        id: dependentIssueId,
+        companyId,
+        title: "Dependent awaiting OpenHands blocker",
+        status: "blocked",
+        assigneeAgentId: otherAgentId,
+      },
+    ]);
+  }
   const lockedRunId = mutation.issue?.checkoutRunId === "other" ? otherRunId : runId;
   const executionRunId = mutation.issue?.executionRunId === "other" ? otherRunId : runId;
   await db.insert(issues).values({
@@ -304,7 +520,24 @@ async function seedFixture(
     checkoutRunId: lockedRunId,
     executionRunId,
     executionLockedAt: mutation.issue?.executionLockedAt === null ? null : new Date(),
+    ...(mutation.lifecycle
+      ? {
+          parentId: parentIssueId,
+          originKind: "routine_execution",
+          originId: routineId,
+          originRunId: routineRunId,
+        }
+      : {}),
   });
+  if (mutation.lifecycle) {
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId,
+      relatedIssueId: dependentIssueId,
+      type: "blocks",
+    });
+    await db.update(routineRuns).set({ linkedIssueId: issueId }).where(eq(routineRuns.id, routineRunId));
+  }
   const actorAgentId = mutation.actor?.agent === "other" ? otherAgentId : agentId;
   const actorRunId = mutation.actor?.run === "other"
     ? otherRunId
@@ -316,6 +549,10 @@ async function seedFixture(
     agentId: actorAgentId,
     runId: actorRunId,
     issueId,
+    otherAgentId,
+    parentIssueId: mutation.lifecycle ? parentIssueId : null,
+    dependentIssueId: mutation.lifecycle ? dependentIssueId : null,
+    routineRunId: mutation.lifecycle ? routineRunId : null,
     lockedRunId,
     token: createLocalAgentJwt(actorAgentId, companyId, "openhands_gateway", actorRunId)!,
   };

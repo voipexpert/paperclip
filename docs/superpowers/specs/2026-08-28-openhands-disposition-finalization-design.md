@@ -35,6 +35,12 @@ The transaction then:
 
 A retry succeeds only when the issue is still `done`, still assigned to the same agent, and the transaction finds the exact non-deleted receipt for that agent, run, body, and marker. It returns the existing receipt and never inserts a second comment. A different run, wrong agent/company, cancellation, reassignment, missing lock, unlocked issue, mismatched evidence, or other stale state returns the same fixed rejection and performs no mutation.
 
+## Post-commit completion lifecycle
+
+The atomic issue-and-receipt transaction remains the only source of disposition truth. After its first successful commit, the route invokes the same smallest completion-lifecycle orchestrator used by the applicable generic `PATCH /api/issues/{issueId}` transition (`in_progress` to `done` with its evidence comment). The shared lifecycle performs routine-run synchronization, run-activity touch, comment reference/external-object synchronization where the caller has not already done so, request-confirmation and terminal-interaction expiry, `issue.updated` and `issue.comment_added` activity, reusable-lease cleanup, dependent and parent wakes, and task-watchdog reconciliation.
+
+Each post-commit hook is isolated: a failure is logged without changing the already committed response, exposing its detail, rolling back the receipt, or preventing later independent hooks. Wake operations use stable ready-state/parent idempotency keys. The dedicated route runs the lifecycle only when the transaction reports `replayed: false`; an exact receipt replay returns the stored receipt and skips every lifecycle effect, so response-loss retries cannot duplicate activity, synchronization, cleanup, wakes, or watchdog work. The generic PATCH branch delegates the same exact completion transition to the orchestrator and gates off its former duplicate branches. Assignee-comment wakes, mentions, blocked/restoration wakes, and stop relays are not applicable to the dedicated server-constructed completion evidence.
+
 ## Evidence Contract
 
 One shared contract defines the repository and Git-ref grammar used before gateway dispatch, for completed-result validation, by the disposition client, and by the route. This prevents a completion that the adapter accepts but the disposition endpoint cannot record. Git-ref punctuation supported by the OpenHands contract includes `/` and `+` (for example `release/v1+meta`); controls, lone surrogates, normalization mismatches, unsafe repository forms, and invalid refs are rejected consistently.
@@ -85,5 +91,7 @@ Focused tests cover:
 - shared evidence grammar, including `release/v1+meta` and unsafe/control rejection;
 - exact 65,536/65,537-byte response bounds, 9,999/10,000-ms timing, timer cleanup, native redirects, and stalled response bodies;
 - deterministic synchronization on a rejecting completion-log attempt without a wall-clock race.
+- rejected acknowledgement, failure, cancellation, and timeout logging failures all settle to their fixed terminal result;
+- first disposition completion invokes the applicable shared lifecycle once, receipt replay invokes it zero additional times, and an injected hook failure cannot change or leak through the committed response.
 
 No production, VM, GitHub, Canvas, OpenHands, coding-VM, or other remote acceptance action is part of this fix wave.

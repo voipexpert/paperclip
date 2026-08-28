@@ -898,6 +898,146 @@ describe("OpenHands gateway contract", () => {
   });
 
   it.each([
+    {
+      name: "a rejected acknowledgement",
+      expected: { exitCode: 1, timedOut: false, errorCode: "OPENHANDS_REJECTED" },
+      terminalLog: "OpenHands gateway dispatch rejected.\n",
+      send: (socket: import("ws").WebSocket, dispatch: Record<string, unknown>) => {
+        socket.send(JSON.stringify({
+          type: "dispatch_ack",
+          version: 1,
+          runId: dispatch.runId,
+          taskId: dispatch.taskId,
+          agentId: dispatch.agentId,
+          accepted: false,
+          reason: "validation",
+        }));
+      },
+    },
+    {
+      name: "a failed terminal result",
+      expected: {
+        exitCode: 1,
+        timedOut: false,
+        errorCode: "OPENHANDS_FAILED",
+        resultJson: { state: "failed", reason: "validation" },
+      },
+      terminalLog: "OpenHands gateway failed.\n",
+      send: (socket: import("ws").WebSocket, dispatch: Record<string, unknown>) => {
+        socket.send(JSON.stringify({
+          type: "dispatch_ack",
+          version: 1,
+          runId: dispatch.runId,
+          taskId: dispatch.taskId,
+          agentId: dispatch.agentId,
+          accepted: true,
+          duplicate: false,
+          state: "accepted",
+        }));
+        socket.send(JSON.stringify({
+          type: "run_result",
+          version: 1,
+          runId: dispatch.runId,
+          taskId: dispatch.taskId,
+          agentId: dispatch.agentId,
+          status: "failed",
+          result: { code: "validation" },
+        }));
+      },
+    },
+    {
+      name: "a cancelled terminal result",
+      expected: {
+        exitCode: 1,
+        timedOut: false,
+        errorCode: "OPENHANDS_CANCELLED",
+        resultJson: { state: "cancelled", reason: "cancelled_by_request" },
+      },
+      terminalLog: "OpenHands gateway cancelled.\n",
+      send: (socket: import("ws").WebSocket, dispatch: Record<string, unknown>) => {
+        socket.send(JSON.stringify({
+          type: "dispatch_ack",
+          version: 1,
+          runId: dispatch.runId,
+          taskId: dispatch.taskId,
+          agentId: dispatch.agentId,
+          accepted: true,
+          duplicate: false,
+          state: "accepted",
+        }));
+        socket.send(JSON.stringify({
+          type: "run_result",
+          version: 1,
+          runId: dispatch.runId,
+          taskId: dispatch.taskId,
+          agentId: dispatch.agentId,
+          status: "cancelled",
+          result: { code: "cancelled_by_request" },
+        }));
+      },
+    },
+    {
+      name: "a timed-out terminal result",
+      expected: {
+        exitCode: 1,
+        timedOut: true,
+        errorCode: "OPENHANDS_TIMEOUT",
+        resultJson: { state: "timed_out", reason: "timeout" },
+      },
+      terminalLog: "OpenHands gateway timed_out.\n",
+      send: (socket: import("ws").WebSocket, dispatch: Record<string, unknown>) => {
+        socket.send(JSON.stringify({
+          type: "dispatch_ack",
+          version: 1,
+          runId: dispatch.runId,
+          taskId: dispatch.taskId,
+          agentId: dispatch.agentId,
+          accepted: true,
+          duplicate: false,
+          state: "accepted",
+        }));
+        socket.send(JSON.stringify({
+          type: "run_result",
+          version: 1,
+          runId: dispatch.runId,
+          taskId: dispatch.taskId,
+          agentId: dispatch.agentId,
+          status: "timed_out",
+          result: { code: "timeout" },
+        }));
+      },
+    },
+  ])("settles $name when terminal logging rejects", async ({ expected, terminalLog, send }) => {
+    await setGatewayToken();
+    const logRejectionDetail = "private logging backend detail";
+    let terminalLogSeen!: () => void;
+    const terminalLogAttempted = new Promise<void>((resolve) => { terminalLogSeen = resolve; });
+    const testGateway = await gateway((socket) => {
+      socket.send(JSON.stringify({ type: "hello", version: 1 }));
+      socket.on("message", (raw) => {
+        const dispatch = JSON.parse(String(raw)) as Record<string, unknown>;
+        send(socket, dispatch);
+      });
+    });
+    try {
+      const resultPromise = execute({
+        ...context(testGateway.port),
+        onLog: async (_stream, line) => {
+          if (line !== terminalLog) return;
+          terminalLogSeen();
+          throw new Error(logRejectionDetail);
+        },
+      });
+      await terminalLogAttempted;
+      const terminalResult = await resultPromise;
+      expect(terminalResult).toMatchObject(expected);
+      expect(JSON.stringify(terminalResult)).not.toContain(logRejectionDetail);
+    } finally {
+      await testGateway.close();
+    }
+  });
+
+  it.each([
     ["failed", "validation", "OPENHANDS_FAILED"],
     ["cancelled", "cancelled_by_request", "OPENHANDS_CANCELLED"],
     ["timed_out", "timeout", "OPENHANDS_TIMEOUT"],
