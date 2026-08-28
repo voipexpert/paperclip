@@ -150,3 +150,75 @@ This report is committed separately so it can record the implementation commit e
 - Confirmed the diff is limited to the two authorized findings, their tests, and required design/plan/report documentation.
 
 Concerns: none within the approved scope. As designed, an isolated lifecycle hook failure is logged and is not retried by exact receipt replay; this deliberately prioritizes no unsafe repeated mutation after the atomic receipt is committed.
+
+## Review follow-up round 1/5
+
+Review requested three additional proofs: observable comment-reference/external-object and interaction-expiry phases, a real generic PATCH parity regression, and a deterministic drain for detached completion work.
+
+### Additional root-cause mapping
+
+- The original production code performed comment reference/external-object synchronization and both route-level interaction-expiry calls, but the production-shaped disposition test could not observe them.
+- The prior test waited only until first-request cleanup/wakes happened. Because receipt replay schedules no shared lifecycle work, that wait did not create a deterministic post-replay background opportunity.
+- The generic PATCH branch called the shared orchestrator, but no real authenticated PATCH test proved exact-once behavior or that removing a legacy gate would duplicate routine/activity/interaction/cleanup/wake/watchdog effects.
+- The issue service itself expires all pending interactions inside the atomic terminal status update, before the agent/run-attributed receipt is inserted. Separately, `expireRequestConfirmationsSupersededByComment` intentionally accepts only a genuine human comment: an agent receipt has `createdByRunId` and cannot be treated as human supersession. The follow-up preserves both security/transaction semantics. The fixture therefore seeds one supersedable confirmation plus one non-supersedable remaining interaction, proves both real route-level expiry phases are invoked once, and verifies both rows end `expired` with `issue_closed`. It does not falsify the attribution model by forcing the agent receipt to produce `superseded_by_comment`.
+
+### RED
+
+Tests were changed before the production seam. Command:
+
+```bash
+PATH=/opt/homebrew/bin:$PATH pnpm exec vitest run \
+  server/src/__tests__/openhands-disposition-route.test.ts \
+  -t "normal completion lifecycle|shared lifecycle exactly once|post-commit hook failure" \
+  --reporter=verbose
+```
+
+Observed result: **1 file failed; 2 tests failed, 1 passed, 13 skipped**. The enhanced real-JWT disposition test and the new real-JWT generic PATCH test each failed at the first independently observable missing behavior: expected one comment-reference synchronization call, received zero. This proved the existing test seam could not cover the required behavior. The hook-failure regression remained GREEN.
+
+### Minimal implementation
+
+- Added call-through lifecycle operations for comment reference sync, external-object sync, comment-confirmation expiry, and terminal interaction expiry. Production defaults remain the existing real services.
+- Routed the applicable generic PATCH operations and legacy branches through the same operations. Consequently, the real generic parity test's exact-once counts fail if any delegation gate is removed.
+- Added one production-safe detached scheduler seam. Production immediately starts an effect and catches/logs a rejection; tests capture every scheduled promise and drain the queue to completion.
+- The disposition test drains the first completion, sends exact receipt replay, drains again, and then asserts every operation/scheduler/activity count is unchanged. The generic PATCH test drains both shared and supplemental generic background tasks before asserting exact-once mutation.
+- Seeded real embedded-Postgres routine, parent/dependent relation, supersedable confirmation, and remaining terminal interaction state. Synchronization and interaction probes call through to the real services; only remote/runtime cleanup, heartbeat wake, and watchdog boundaries remain controlled doubles.
+
+### GREEN and regression evidence
+
+Targeted lifecycle command after implementation: **1 file passed; 3 tests passed, 13 skipped**.
+
+Full disposition route:
+
+```bash
+PATH=/opt/homebrew/bin:$PATH pnpm exec vitest run \
+  server/src/__tests__/openhands-disposition-route.test.ts \
+  --reporter=dot
+```
+
+Result: **1 file passed, 16 tests passed**.
+
+Final focused OpenHands lane (same six-file command recorded above): **6 files passed, 149 tests passed**.
+
+Shared generic lifecycle routes (same four-file command recorded above): **4 files passed, 94 tests passed**.
+
+Recovery lane (same seven-file command recorded above): **7 files passed, 98 tests passed**.
+
+Static/build/diff commands:
+
+```bash
+PATH=/opt/homebrew/bin:$PATH pnpm --filter @paperclipai/server typecheck
+PATH=/opt/homebrew/bin:$PATH pnpm --filter @paperclipai/server build
+git diff --check
+```
+
+Result: all exited 0 under Node 26. The final feature run was repeated after removing an invalid assertion about which layer returned the expired rows; persisted real interaction state and exact route-level call counts remain asserted.
+
+### Round 1 self-review
+
+- The seam defaults are the previous real production operations; only tests inject call-through probes and a promise collector.
+- Generic non-delegated paths still receive the same routine, run-activity, sync, interaction, cleanup, wake, and watchdog behavior through the shared dependency object.
+- The generic delegated completion test observes exactly one routine sync, run touch, comment reference sync, external sync, each route-level interaction phase, cleanup, watchdog reconciliation, two intended wakes, two activity rows, and one comment after draining all scheduled work.
+- Receipt replay produces no second scheduled shared lifecycle task and no effect/activity count change after the deterministic second drain.
+- No JWT, raw environment, response body, token, or private hook failure was logged or added to evidence.
+
+Updated concern: the review phrase "superseded request confirmation" cannot literally apply to the OpenHands receipt without weakening an intentional invariant. The receipt is agent/run-attributed, and the service only lets genuine human comments supersede confirmations; additionally, the atomic terminal update expires pending interactions before receipt insertion. This round tests the real behavior rather than changing those established semantics.

@@ -11,6 +11,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRelations,
+  issueThreadInteractions,
   issues,
   routineRuns,
   routines,
@@ -20,7 +21,10 @@ import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { issueRoutes } from "../routes/issues.js";
 import { decideSuccessfulRunHandoff } from "../services/recovery/successful-run-handoff.js";
+import { externalObjectService } from "../services/external-objects.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { issueReferenceService } from "../services/issue-references.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { routineService } from "../services/routines.js";
 import {
   describeEmbeddedPostgres,
@@ -70,6 +74,41 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
     } as never));
     instance.use(errorHandler);
     return instance;
+  }
+
+  function lifecycleHarness() {
+    const references = issueReferenceService(postgres.db);
+    const externalObjects = externalObjectService(postgres.db, { enabled: false });
+    const interactions = issueThreadInteractionService(postgres.db);
+    const detached: Promise<void>[] = [];
+    let drained = 0;
+    const hooks = {
+      syncRoutineRunStatusForIssue: vi.fn(async (issueId: string) =>
+        routineService(postgres.db).syncRunStatusForIssue(issueId)),
+      reportRunActivity: vi.fn(async () => undefined),
+      syncCommentReferences: vi.fn((commentId: string) => references.syncComment(commentId)),
+      syncCommentExternalObjects: vi.fn((commentId: string) => externalObjects.syncCommentSafely(commentId)),
+      expireRequestConfirmationsSupersededByComment: vi.fn(
+        interactions.expireRequestConfirmationsSupersededByComment,
+      ),
+      expirePendingInteractionsForTerminalIssue: vi.fn(
+        interactions.expirePendingInteractionsForTerminalIssue,
+      ),
+      destroyReusableSandboxLeases: vi.fn(async () => []),
+      reconcileTaskWatchdogs: vi.fn(async () => undefined),
+      wakeup: vi.fn(async () => null),
+      scheduleDetachedLifecycle: vi.fn((effect: () => Promise<void>) => {
+        detached.push(effect());
+      }),
+    };
+    return {
+      hooks,
+      async drain() {
+        while (drained < detached.length) {
+          await detached[drained++];
+        }
+      },
+    };
   }
 
   async function postDisposition(fixture: Fixture, body: Record<string, unknown> = evidence) {
@@ -136,19 +175,20 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
 
   it("runs the normal completion lifecycle once and skips every effect on receipt replay", async () => {
     const fixture = await seedFixture(postgres.db, { lifecycle: true });
-    const syncRoutineRunStatusForIssue = vi.fn(async (issueId: string) =>
-      routineService(postgres.db).syncRunStatusForIssue(issueId));
-    const reportRunActivity = vi.fn(async () => undefined);
-    const destroyReusableSandboxLeases = vi.fn(async () => []);
-    const reconcileTaskWatchdogs = vi.fn(async () => undefined);
-    const wakeup = vi.fn(async () => null);
-    const lifecycleHooks = {
-      syncRoutineRunStatusForIssue,
-      reportRunActivity,
+    const lifecycle = lifecycleHarness();
+    const lifecycleHooks = lifecycle.hooks;
+    const {
       destroyReusableSandboxLeases,
+      expirePendingInteractionsForTerminalIssue,
+      expireRequestConfirmationsSupersededByComment,
       reconcileTaskWatchdogs,
+      reportRunActivity,
+      scheduleDetachedLifecycle,
+      syncCommentExternalObjects,
+      syncCommentReferences,
+      syncRoutineRunStatusForIssue,
       wakeup,
-    };
+    } = lifecycleHooks;
 
     const first = await request(app(lifecycleHooks))
       .post(`/api/issues/${fixture.issueId}/openhands-disposition`)
@@ -157,14 +197,19 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
 
     expect(first.status).toBe(200);
     expect(first.body.replayed).toBe(false);
+    await lifecycle.drain();
     expect(syncRoutineRunStatusForIssue).toHaveBeenCalledOnce();
     expect(syncRoutineRunStatusForIssue).toHaveBeenCalledWith(fixture.issueId);
     expect(reportRunActivity).toHaveBeenCalledOnce();
     expect(reportRunActivity).toHaveBeenCalledWith(fixture.runId);
-    await vi.waitFor(() => {
-      expect(destroyReusableSandboxLeases).toHaveBeenCalledOnce();
-      expect(wakeup).toHaveBeenCalledTimes(2);
-    });
+    expect(syncCommentReferences).toHaveBeenCalledOnce();
+    expect(syncCommentReferences).toHaveBeenCalledWith(first.body.commentId);
+    expect(syncCommentExternalObjects).toHaveBeenCalledOnce();
+    expect(syncCommentExternalObjects).toHaveBeenCalledWith(first.body.commentId);
+    expect(expireRequestConfirmationsSupersededByComment).toHaveBeenCalledOnce();
+    expect(expirePendingInteractionsForTerminalIssue).toHaveBeenCalledOnce();
+    expect(scheduleDetachedLifecycle).toHaveBeenCalledOnce();
+    expect(destroyReusableSandboxLeases).toHaveBeenCalledOnce();
     expect(destroyReusableSandboxLeases).toHaveBeenCalledWith({
       companyId: fixture.companyId,
       issueId: fixture.issueId,
@@ -238,6 +283,22 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
         }),
       }),
     ]));
+    const lifecycleInteractions = await postgres.db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.issueId, fixture.issueId));
+    expect(lifecycleInteractions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: fixture.supersedableConfirmationId,
+        status: "expired",
+        result: expect.objectContaining({ outcome: "issue_closed" }),
+      }),
+      expect.objectContaining({
+        id: fixture.terminalInteractionId,
+        status: "expired",
+        result: expect.objectContaining({ outcome: "issue_closed" }),
+      }),
+    ]));
 
     const replay = await request(app(lifecycleHooks))
       .post(`/api/issues/${fixture.issueId}/openhands-disposition`)
@@ -246,9 +307,15 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
 
     expect(replay.status).toBe(200);
     expect(replay.body.replayed).toBe(true);
+    await lifecycle.drain();
     expect(syncRoutineRunStatusForIssue).toHaveBeenCalledTimes(1);
     expect(reportRunActivity).toHaveBeenCalledTimes(1);
-    await vi.waitFor(() => expect(destroyReusableSandboxLeases).toHaveBeenCalledTimes(1));
+    expect(syncCommentReferences).toHaveBeenCalledTimes(1);
+    expect(syncCommentExternalObjects).toHaveBeenCalledTimes(1);
+    expect(expireRequestConfirmationsSupersededByComment).toHaveBeenCalledTimes(1);
+    expect(expirePendingInteractionsForTerminalIssue).toHaveBeenCalledTimes(1);
+    expect(scheduleDetachedLifecycle).toHaveBeenCalledTimes(1);
+    expect(destroyReusableSandboxLeases).toHaveBeenCalledTimes(1);
     expect(reconcileTaskWatchdogs).toHaveBeenCalledTimes(1);
     expect(wakeup).toHaveBeenCalledTimes(2);
     const replayActivities = await postgres.db
@@ -261,21 +328,57 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
     expect(replayActivities).toHaveLength(2);
   });
 
+  it("uses the shared lifecycle exactly once for generic PATCH completion without legacy duplicates", async () => {
+    const fixture = await seedFixture(postgres.db, { lifecycle: true });
+    const lifecycle = lifecycleHarness();
+    const response = await request(app(lifecycle.hooks))
+      .patch(`/api/issues/${fixture.issueId}`)
+      .set("Authorization", `Bearer ${fixture.token}`)
+      .send({ status: "done", comment: "Validated completion evidence." });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toMatchObject({ id: fixture.issueId, status: "done" });
+    await lifecycle.drain();
+
+    expect(lifecycle.hooks.syncRoutineRunStatusForIssue).toHaveBeenCalledOnce();
+    expect(lifecycle.hooks.reportRunActivity).toHaveBeenCalledOnce();
+    expect(lifecycle.hooks.syncCommentReferences).toHaveBeenCalledOnce();
+    expect(lifecycle.hooks.syncCommentExternalObjects).toHaveBeenCalledOnce();
+    expect(lifecycle.hooks.expireRequestConfirmationsSupersededByComment).toHaveBeenCalledOnce();
+    expect(lifecycle.hooks.expirePendingInteractionsForTerminalIssue).toHaveBeenCalledOnce();
+    expect(lifecycle.hooks.destroyReusableSandboxLeases).toHaveBeenCalledOnce();
+    expect(lifecycle.hooks.reconcileTaskWatchdogs).toHaveBeenCalledOnce();
+    expect(lifecycle.hooks.wakeup).toHaveBeenCalledTimes(2);
+    expect(lifecycle.hooks.scheduleDetachedLifecycle).toHaveBeenCalledTimes(2);
+
+    const [activities, persistedInteractions, comments] = await Promise.all([
+      postgres.db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, fixture.issueId),
+        inArray(activityLog.action, ["issue.updated", "issue.comment_added"]),
+      )),
+      postgres.db.select().from(issueThreadInteractions).where(
+        eq(issueThreadInteractions.issueId, fixture.issueId),
+      ),
+      postgres.db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issueId)),
+    ]);
+    expect(activities).toHaveLength(2);
+    expect(comments).toHaveLength(1);
+    expect(persistedInteractions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: fixture.supersedableConfirmationId, status: "expired" }),
+      expect.objectContaining({ id: fixture.terminalInteractionId, status: "expired" }),
+    ]));
+  });
+
   it("isolates a post-commit hook failure and never retries lifecycle mutation on receipt replay", async () => {
     const fixture = await seedFixture(postgres.db);
     const hookFailureDetail = "private routine hook failure";
+    const lifecycle = lifecycleHarness();
     const syncRoutineRunStatusForIssue = vi.fn(async () => {
       throw new Error(hookFailureDetail);
     });
-    const reportRunActivity = vi.fn(async () => undefined);
-    const destroyReusableSandboxLeases = vi.fn(async () => []);
-    const reconcileTaskWatchdogs = vi.fn(async () => undefined);
     const lifecycleHooks = {
+      ...lifecycle.hooks,
       syncRoutineRunStatusForIssue,
-      reportRunActivity,
-      destroyReusableSandboxLeases,
-      reconcileTaskWatchdogs,
-      wakeup: vi.fn(async () => null),
     };
 
     const first = await request(app(lifecycleHooks))
@@ -286,6 +389,7 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
       .post(`/api/issues/${fixture.issueId}/openhands-disposition`)
       .set("Authorization", `Bearer ${fixture.token}`)
       .send(evidence);
+    await lifecycle.drain();
 
     expect(first.status).toBe(200);
     expect(first.body.replayed).toBe(false);
@@ -293,9 +397,9 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
     expect(replay.status).toBe(200);
     expect(replay.body.replayed).toBe(true);
     expect(syncRoutineRunStatusForIssue).toHaveBeenCalledTimes(1);
-    expect(reportRunActivity).toHaveBeenCalledTimes(1);
-    await vi.waitFor(() => expect(destroyReusableSandboxLeases).toHaveBeenCalledTimes(1));
-    expect(reconcileTaskWatchdogs).toHaveBeenCalledTimes(1);
+    expect(lifecycle.hooks.reportRunActivity).toHaveBeenCalledTimes(1);
+    expect(lifecycle.hooks.destroyReusableSandboxLeases).toHaveBeenCalledTimes(1);
+    expect(lifecycle.hooks.reconcileTaskWatchdogs).toHaveBeenCalledTimes(1);
     const comments = await postgres.db
       .select()
       .from(issueComments)
@@ -438,6 +542,8 @@ async function seedFixture(
   const dependentIssueId = randomUUID();
   const routineId = randomUUID();
   const routineRunId = randomUUID();
+  const supersedableConfirmationId = randomUUID();
+  const terminalInteractionId = randomUUID();
   await db.insert(companies).values({
     id: companyId,
     name: "OpenHands disposition test",
@@ -537,6 +643,43 @@ async function seedFixture(
       type: "blocks",
     });
     await db.update(routineRuns).set({ linkedIssueId: issueId }).where(eq(routineRuns.id, routineRunId));
+    await db.insert(issueThreadInteractions).values([
+      {
+        id: supersedableConfirmationId,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: otherAgentId,
+        sourceRunId: otherAgentRunId,
+        payload: {
+          version: 1,
+          prompt: "Is this completion ready?",
+          supersedeOnUserComment: true,
+        },
+      },
+      {
+        id: terminalInteractionId,
+        companyId,
+        issueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: otherAgentId,
+        sourceRunId: otherAgentRunId,
+        payload: {
+          version: 1,
+          supersedeOnUserComment: false,
+          questions: [{
+            id: "remaining-question",
+            prompt: "What should happen next?",
+            selectionMode: "single",
+            options: [{ id: "wait", label: "Wait" }],
+          }],
+        },
+      },
+    ]);
   }
   const actorAgentId = mutation.actor?.agent === "other" ? otherAgentId : agentId;
   const actorRunId = mutation.actor?.run === "other"
@@ -553,6 +696,8 @@ async function seedFixture(
     parentIssueId: mutation.lifecycle ? parentIssueId : null,
     dependentIssueId: mutation.lifecycle ? dependentIssueId : null,
     routineRunId: mutation.lifecycle ? routineRunId : null,
+    supersedableConfirmationId: mutation.lifecycle ? supersedableConfirmationId : null,
+    terminalInteractionId: mutation.lifecycle ? terminalInteractionId : null,
     lockedRunId,
     token: createLocalAgentJwt(actorAgentId, companyId, "openhands_gateway", actorRunId)!,
   };
