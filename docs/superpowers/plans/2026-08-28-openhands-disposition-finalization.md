@@ -118,7 +118,7 @@
 
   ```bash
   pnpm exec vitest run server/src/adapters/openhands-gateway/disposition.test.ts server/src/adapters/openhands-gateway/execute.test.ts
-  pnpm exec vitest run server/src/adapters/openhands-gateway/recovery.test.ts server/src/services/agent-runtime-service.pause.test.ts server/src/services/heartbeat-retry.test.ts
+  pnpm exec vitest run server/src/services/recovery/successful-run-handoff.test.ts server/src/services/recovery/service.pause-durability.test.ts server/src/__tests__/heartbeat-retry-scheduling.test.ts
   pnpm --filter @paperclipai/server typecheck
   git diff --check
   ```
@@ -136,7 +136,7 @@
 
   ```bash
   pnpm exec vitest run server/src/adapters/openhands-gateway/disposition.test.ts server/src/adapters/openhands-gateway/execute.test.ts
-  pnpm exec vitest run server/src/adapters/openhands-gateway/recovery.test.ts server/src/services/agent-runtime-service.pause.test.ts server/src/services/heartbeat-retry.test.ts
+  pnpm exec vitest run server/src/services/recovery/successful-run-handoff.test.ts server/src/services/recovery/service.pause-durability.test.ts server/src/__tests__/heartbeat-retry-scheduling.test.ts
   pnpm --filter @paperclipai/server typecheck
   pnpm --filter @paperclipai/server build
   git diff --check origin/master...HEAD
