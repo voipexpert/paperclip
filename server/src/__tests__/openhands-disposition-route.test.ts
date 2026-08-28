@@ -61,7 +61,9 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
     else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalJwtSecret;
   });
 
-  function app(completionLifecycleHooks?: Record<string, unknown>) {
+  type IssueRouteOptions = Parameters<typeof issueRoutes>[2];
+
+  function app(completionLifecycleHooks?: IssueRouteOptions["completionLifecycleHooks"]) {
     const instance = express();
     instance.use(express.json());
     instance.use(actorMiddleware(postgres.db, {
@@ -71,7 +73,7 @@ describeEmbeddedPostgres("OpenHands transactional disposition route", () => {
     instance.use("/api", issueRoutes(postgres.db, {} as never, {
       taskWatchdogEnqueueWakeup: null,
       completionLifecycleHooks,
-    } as never));
+    }));
     instance.use(errorHandler);
     return instance;
   }
