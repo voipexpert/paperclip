@@ -301,6 +301,17 @@ describe("openapi routes", () => {
       "409",
       "500",
     ]);
+    expect(disposition.responses["200"].content["application/json"].schema).toEqual({
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        status: { type: "string", enum: ["done"] },
+        replayed: { type: "boolean" },
+        commentId: { type: "string" },
+      },
+      required: ["id", "status", "replayed", "commentId"],
+      additionalProperties: false,
+    });
   });
 
   it("documents auth and reviewed response-code invariants", () => {
