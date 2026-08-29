@@ -166,6 +166,15 @@ expect(login.dig('with', 'password') == '${{ secrets.GITHUB_TOKEN }}', 'login mu
 buildx = step(steps, 'buildx')
 expect(buildx['uses'] == "docker/setup-buildx-action@#{expected_actions['docker/setup-buildx-action']}", 'buildx setup must use the pinned action')
 
+immutability = step(steps, 'immutability')
+immutability_run = immutability.fetch('run')
+expect(steps.index(immutability) < steps.index(step(steps, 'build')), 'immutable tag existence check must run before the image push')
+expect(immutability.dig('env', 'IMAGE_TAG') == '${{ steps.source.outputs.tag }}', 'immutable tag existence check must use the validated image tag')
+expect(immutability_run.include?('docker buildx imagetools inspect "$IMAGE_TAG"'), 'immutable tag existence check must query GHCR before pushing')
+expect(immutability_run.include?('Refusing to replace existing immutable image tag'), 'existing immutable tags must stop publication')
+expect(immutability_run.include?('manifest unknown') && immutability_run.include?('not found'), 'only a confirmed missing manifest may proceed to publication')
+expect(immutability_run.include?('Unable to confirm immutable image tag is unused'), 'registry inspection errors must fail closed')
+
 build = step(steps, 'build')
 expect(build['uses'] == "docker/build-push-action@#{expected_actions['docker/build-push-action']}", 'build must use the pinned build-push action')
 build_with = build.fetch('with')
