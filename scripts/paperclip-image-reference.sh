@@ -5,16 +5,32 @@ invalid() {
   exit 1
 }
 
+is_lower_hex_of_length() {
+  value=$1
+  required_length=$2
+
+  case "$value" in
+    ''|*[!0123456789abcdef]*) return 1 ;;
+  esac
+
+  [ "$(LC_ALL=C printf '%s' "$value" | wc -c)" -eq "$required_length" ]
+}
+
 [ "$#" -ge 1 ] && [ "$#" -le 2 ] || invalid
 
 commit=$1
-if ! printf '%s\n' "$commit" | LC_ALL=C grep -E '^[0-9a-f]{40}$' >/dev/null 2>&1; then
+if ! is_lower_hex_of_length "$commit" 40; then
   invalid
 fi
 
 if [ "$#" -eq 2 ]; then
   digest=$2
-  if ! printf '%s\n' "$digest" | LC_ALL=C grep -E '^sha256:[0-9a-f]{64}$' >/dev/null 2>&1; then
+  case "$digest" in
+    sha256:*) digest_hex=${digest#sha256:} ;;
+    *) invalid ;;
+  esac
+
+  if ! is_lower_hex_of_length "$digest_hex" 64; then
     invalid
   fi
 fi

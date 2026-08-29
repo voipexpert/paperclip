@@ -64,9 +64,13 @@ assert_case missing_commit 1 '' "$error"
 assert_case uppercase_commit 1 '' "$error" '0123456789ABCDEF0123456789abcdef01234567'
 assert_case nonhex_commit 1 '' "$error" '0123456789abcdef0123456789abcdef0123456g'
 assert_case short_commit 1 '' "$error" '0123456789abcdef0123456789abcdef0123456'
+assert_case newline_commit_payload 1 '' "$error" "$commit"$'\n'payload
+assert_case control_commit_payload 1 '' "$error" "$commit"$'\001payload'
 assert_case uppercase_digest 1 '' "$error" "$commit" 'sha256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef'
 assert_case wrong_digest_algorithm 1 '' "$error" "$commit" 'sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 assert_case short_digest 1 '' "$error" "$commit" 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde'
+assert_case newline_digest_payload 1 '' "$error" "$commit" "$digest"$'\n'payload
+assert_case control_digest_payload 1 '' "$error" "$commit" "$digest"$'\001payload'
 assert_case extra_argument 1 '' "$error" "$commit" "$digest" extra
 
 printf 'paperclip image reference tests passed\n'
