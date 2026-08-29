@@ -237,6 +237,7 @@ import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
   companyImportTransferDeclarationSchema,
 } from "@paperclipai/shared/company-import-transfer";
+import { openHandsDispositionEvidenceSchema } from "../adapters/openhands-gateway/disposition-contract.js";
 
 type JsonSchema = Record<string, unknown>;
 type OpenApiResponse = Record<string, unknown>;
@@ -781,6 +782,7 @@ function registerCurrentRoute(input: {
 type OpenApiAuthLevel =
   | "public"
   | "authenticated"
+  | "agent"
   | "board"
   | "instance_admin";
 
@@ -799,6 +801,10 @@ const BOARD_SECURITY: Array<Record<string, string[]>> = [
 
 const AUTHENTICATED_SECURITY: Array<Record<string, string[]>> = [
   ...BOARD_SECURITY,
+  securityRequirement(AGENT_BEARER_AUTH_SCHEME),
+];
+
+const AGENT_SECURITY: Array<Record<string, string[]>> = [
   securityRequirement(AGENT_BEARER_AUTH_SCHEME),
 ];
 
@@ -978,6 +984,10 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
   "PUT /api/admin/users/{userId}/company-access",
 ]);
 
+const AGENT_ONLY_OPERATIONS = new Set([
+  "POST /api/issues/{id}/openhands-disposition",
+]);
+
 const CREATED_OPERATIONS = new Set([
   "POST /api/adapters/install",
   "POST /api/companies/{companyId}/agent-hires",
@@ -1064,6 +1074,7 @@ function resolveOperationAuthLevel(method: string, path: string): OpenApiAuthLev
   const key = operationKey(method, path);
   if (PUBLIC_OPERATIONS.has(key)) return "public";
   if (INSTANCE_ADMIN_OPERATIONS.has(key)) return "instance_admin";
+  if (AGENT_ONLY_OPERATIONS.has(key)) return "agent";
   if (isBoardOnlyOperation(method, path)) return "board";
   return "authenticated";
 }
@@ -1112,6 +1123,8 @@ function applyDocumentFixups(document: any): any {
         operation.security = [];
       } else if (authLevel === "authenticated") {
         operation.security = AUTHENTICATED_SECURITY;
+      } else if (authLevel === "agent") {
+        operation.security = AGENT_SECURITY;
       } else {
         operation.security = BOARD_SECURITY;
       }
@@ -1121,6 +1134,8 @@ function applyDocumentFixups(document: any): any {
           ? { actor: "board", instanceAdmin: true }
           : authLevel === "board"
             ? { actor: "board" }
+            : authLevel === "agent"
+              ? { actor: "agent" }
             : authLevel === "authenticated"
               ? { actor: "board_or_agent" }
               : { actor: "public" };
@@ -2531,6 +2546,30 @@ registry.registerPath({
     body: jsonBody(checkoutIssueSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/openhands-disposition",
+  tags: ["issues"],
+  summary: "Finalize an OpenHands issue disposition",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(openHandsDispositionEvidenceSchema),
+  },
+  responses: {
+    200: r.ok(z.object({
+      id: z.string(),
+      status: z.literal("done"),
+      replayed: z.boolean(),
+      commentId: z.string(),
+    }).strict()),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    500: r.serverError,
+  },
 });
 
 registry.registerPath({

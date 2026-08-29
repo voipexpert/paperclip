@@ -57,6 +57,10 @@ jobs:
 
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
+
+      - name: Test immutable image publication workflow contract
+        run: pnpm test:image-workflow
+
       - name: Test PR quality-gate scripts
         run: node --test '.github/scripts/tests/*.test.mjs'
 

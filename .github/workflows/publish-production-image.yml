@@ -1,0 +1,151 @@
+name: Publish immutable production image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full lowercase 40-character commit reachable from origin/master
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-production-image-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'voipexpert/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout trusted master
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate source commit and select exact checkout
+        id: source
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          reference="$(scripts/paperclip-image-reference.sh "$SOURCE_COMMIT")"
+          tag="${reference#tag=}"
+          [ "$reference" = "tag=$tag" ]
+          install -m 0755 scripts/paperclip-image-reference.sh "$RUNNER_TEMP/paperclip-image-reference.sh"
+
+          git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
+          git cat-file -e "${SOURCE_COMMIT}^{commit}"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" origin/master
+          git checkout --detach "$SOURCE_COMMIT"
+          [ "$(git rev-parse HEAD)" = "$SOURCE_COMMIT" ]
+
+          {
+            printf 'tag=%s\n' "$tag"
+            printf 'commit=%s\n' "$SOURCE_COMMIT"
+            printf 'helper=%s\n' "$RUNNER_TEMP/paperclip-image-reference.sh"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        id: login
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Verify immutable tag is unused
+        id: immutability
+        env:
+          IMAGE_TAG: ${{ steps.source.outputs.tag }}
+        run: |
+          set -euo pipefail
+          inspection_error="$RUNNER_TEMP/paperclip-image-tag-inspection.err"
+
+          if docker buildx imagetools inspect "$IMAGE_TAG" >/dev/null 2>"$inspection_error"; then
+            echo '::error::Refusing to replace existing immutable image tag'
+            exit 1
+          fi
+
+          if grep -Fqi 'manifest unknown' "$inspection_error" || grep -Fqi "$IMAGE_TAG: not found" "$inspection_error"; then
+            exit 0
+          fi
+
+          cat "$inspection_error" >&2
+          echo '::error::Unable to confirm immutable image tag is unused'
+          exit 1
+
+      - name: Build and push immutable production image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: production
+          build-args: |
+            PAPERCLIP_BUILD_COMMIT=${{ steps.source.outputs.commit }}
+          tags: ${{ steps.source.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ steps.source.outputs.commit }}
+          push: true
+
+      - name: Validate digest and write bounded attestation
+        id: attestation
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_REFERENCE_HELPER: ${{ steps.source.outputs.helper }}
+          ATTESTATION: ${{ runner.temp }}/paperclip-image-attestation.json
+        run: |
+          set -euo pipefail
+          reference="$("$IMAGE_REFERENCE_HELPER" "$SOURCE_COMMIT" "$DIGEST")"
+          tag_line="$(printf '%s\n' "$reference" | sed -n '1p')"
+          image_line="$(printf '%s\n' "$reference" | sed -n '2p')"
+          tag="${tag_line#tag=}"
+          image="${image_line#image=}"
+          [ "$tag_line" = "tag=$tag" ]
+          [ "$image_line" = "image=$image" ]
+
+          repository='ghcr.io/voipexpert/paperclip'
+          built_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          printf '{\n  "commit": "%s",\n  "tag": "%s",\n  "digest": "%s",\n  "repository": "%s",\n  "built_at": "%s"\n}\n' \
+            "$SOURCE_COMMIT" "$tag" "$DIGEST" "$repository" "$built_at" > "$ATTESTATION"
+
+          ATTESTATION="$ATTESTATION" ruby -r json - <<'RUBY'
+          document = JSON.parse(File.read(ENV.fetch('ATTESTATION')))
+          expected_keys = ['commit', 'tag', 'digest', 'repository', 'built_at']
+          abort 'invalid attestation keys' unless document.keys.sort == expected_keys.sort
+          abort 'invalid attestation commit' unless document.fetch('commit').match?(/\A[0-9a-f]{40}\z/)
+          abort 'invalid attestation tag' unless document.fetch('tag') == "ghcr.io/voipexpert/paperclip:sha-#{document.fetch('commit')}"
+          abort 'invalid attestation digest' unless document.fetch('digest').match?(/\Asha256:[0-9a-f]{64}\z/)
+          abort 'invalid attestation repository' unless document.fetch('repository') == 'ghcr.io/voipexpert/paperclip'
+          abort 'invalid attestation timestamp' unless document.fetch('built_at').match?(/\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z/)
+          RUBY
+
+          {
+            printf '%s\n' '## Paperclip production image'
+            printf '\n'
+            printf '%s\n' "- Commit: \`$SOURCE_COMMIT\`"
+            printf '%s\n' "- Tag: \`$tag\`"
+            printf '%s\n' "- Digest-pinned image: \`$image\`"
+            printf '%s\n' "- Repository: \`$repository\`"
+            printf '%s\n' "- Built at: \`$built_at\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image attestation
+        id: upload-attestation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: paperclip-image-attestation
+          path: ${{ runner.temp }}/paperclip-image-attestation.json
+          retention-days: 14
