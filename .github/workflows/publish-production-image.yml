@@ -48,6 +48,7 @@ jobs:
           [ "$(git rev-parse HEAD)" = "$SOURCE_COMMIT" ]
 
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
           printf 'helper=%s\n' "$RUNNER_TEMP/paperclip-image-reference.sh" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
@@ -70,8 +71,9 @@ jobs:
           file: ./Dockerfile
           target: production
           build-args: |
-            PAPERCLIP_BUILD_COMMIT=${{ inputs.source_commit }}
+            PAPERCLIP_BUILD_COMMIT=${{ steps.source.outputs.commit }}
           tags: ${{ steps.source.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ steps.source.outputs.commit }}
           push: true
 
       - name: Validate digest and write bounded attestation

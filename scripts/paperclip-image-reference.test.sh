@@ -79,8 +79,10 @@ assert_case extra_argument 1 '' "$error" "$commit" "$digest" extra
 test_workflow_contract() {
   [ -f "$WORKFLOW" ] || fail 'publish-production-image workflow is absent'
 
-  ruby -r yaml -r json - "$WORKFLOW" <<'RUBY'
+  ruby -r yaml -r json - "$WORKFLOW" "$REPOSITORY_ROOT/package.json" "$REPOSITORY_ROOT/.github/workflows/pr.yml" <<'RUBY'
 workflow_path = ARGV.fetch(0)
+package_path = ARGV.fetch(1)
+pr_workflow_path = ARGV.fetch(2)
 workflow = YAML.safe_load(File.read(workflow_path), aliases: false)
 
 def fail_contract(message)
@@ -153,6 +155,7 @@ expect(source.dig('env', 'SOURCE_COMMIT') == '${{ inputs.source_commit }}', 'sou
   '[ "$(git rev-parse HEAD)" = "$SOURCE_COMMIT" ]'
 ].each { |required| expect(source_run.include?(required), "source validation must include #{required}") }
 expect(source_run.include?('tag=') && source_run.include?('$GITHUB_OUTPUT'), 'validated immutable tag must be exported for the build')
+expect(source_run.include?('commit=') && source_run.include?('$GITHUB_OUTPUT'), 'validated commit must be exported for the build')
 expect(source_run.include?('helper=') && source_run.include?('$GITHUB_OUTPUT'), 'trusted formatter path must survive the detached checkout')
 
 login = step(steps, 'login')
@@ -169,10 +172,12 @@ build_with = build.fetch('with')
 expect(build_with['context'] == '.', 'build context must be the repository root')
 expect(build_with['file'] == './Dockerfile', 'build must use the production Dockerfile')
 expect(build_with['target'] == 'production', 'build target must be production')
-expect(build_with['build-args'].include?('PAPERCLIP_BUILD_COMMIT=${{ inputs.source_commit }}'), 'build must stamp the selected commit')
+expect(build_with['build-args'].include?('PAPERCLIP_BUILD_COMMIT=${{ steps.source.outputs.commit }}'), 'build must stamp the validated selected commit')
 expect(build_with['tags'] == '${{ steps.source.outputs.tag }}', 'build must publish only the validated immutable tag')
 expect(build_with['push'] == true, 'build must push the immutable image')
-expect(!build_with.key?('labels'), 'build must not add mutable metadata labels')
+expected_revision_label = 'org.opencontainers.image.revision=${{ steps.source.outputs.commit }}'
+expect(build_with['labels'] == expected_revision_label, 'build must set exactly the validated OCI revision label')
+expect(!build_with['labels'].include?('inputs.source_commit'), 'OCI revision label must not use the raw unchecked workflow input')
 expect(!build_with.to_s.include?('latest'), 'build must not publish a latest tag')
 
 attestation = step(steps, 'attestation')
@@ -189,6 +194,16 @@ upload = step(steps, 'upload-attestation')
 expect(upload.dig('with', 'name') == 'paperclip-image-attestation', 'attestation artifact name is incorrect')
 expect(upload.dig('with', 'path') == '${{ runner.temp }}/paperclip-image-attestation.json', 'attestation artifact path is incorrect')
 expect(upload.dig('with', 'retention-days') == 14, 'attestation artifact retention must be bounded to 14 days')
+
+package = JSON.parse(File.read(package_path))
+expect(package.dig('scripts', 'test:image-workflow') == 'bash scripts/paperclip-image-reference.test.sh', 'package image workflow contract script is missing')
+
+pr_workflow = YAML.safe_load(File.read(pr_workflow_path), aliases: false)
+pr_events = pr_workflow['on'] || pr_workflow[true]
+expect(pr_events.key?('pull_request'), 'PR workflow must retain its pull_request trigger')
+expect(!pr_events.key?('pull_request_target'), 'PR workflow must not use pull_request_target')
+policy_steps = pr_workflow.dig('jobs', 'policy', 'steps')
+expect(policy_steps.any? { |candidate| candidate['run'] == 'pnpm test:image-workflow' }, 'safe PR policy job must run the image workflow contract')
 RUBY
 }
 
