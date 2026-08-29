@@ -275,6 +275,34 @@ describe("openapi routes", () => {
     });
   });
 
+  it("documents the agent-only OpenHands disposition contract", () => {
+    const { spec } = loadSpecRoutes();
+    const disposition = spec.paths["/api/issues/{id}/openhands-disposition"].post;
+
+    expect(disposition.summary).toBe("Finalize an OpenHands issue disposition");
+    expect(disposition.security).toEqual([{ AgentBearerAuth: [] }]);
+    expect(disposition["x-paperclip-authorization"]).toEqual({ actor: "agent" });
+    expect(disposition.requestBody.content["application/json"].schema).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["outcome", "repository", "baseRef", "commit"],
+      properties: {
+        outcome: { type: "string", enum: ["change", "no_change"] },
+        repository: { type: "string" },
+        baseRef: { type: "string" },
+        commit: { type: "string", pattern: "^[0-9a-f]{40}$" },
+      },
+    });
+    expect(Object.keys(disposition.responses).sort()).toEqual([
+      "200",
+      "400",
+      "401",
+      "403",
+      "409",
+      "500",
+    ]);
+  });
+
   it("documents auth and reviewed response-code invariants", () => {
     const { spec } = loadSpecRoutes();
 
