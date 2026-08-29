@@ -47,9 +47,11 @@ jobs:
           git checkout --detach "$SOURCE_COMMIT"
           [ "$(git rev-parse HEAD)" = "$SOURCE_COMMIT" ]
 
-          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
-          printf 'commit=%s\n' "$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
-          printf 'helper=%s\n' "$RUNNER_TEMP/paperclip-image-reference.sh" >> "$GITHUB_OUTPUT"
+          {
+            printf 'tag=%s\n' "$tag"
+            printf 'commit=%s\n' "$SOURCE_COMMIT"
+            printf 'helper=%s\n' "$RUNNER_TEMP/paperclip-image-reference.sh"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         id: login
